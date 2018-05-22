@@ -8,6 +8,7 @@ import (
 )
 
 func TestParseSingle(t *testing.T) {
+	t.Parallel()
 	target, err := GetTarget("linux", "amd64")
 	if err != nil {
 		t.Fatal(err)
@@ -40,6 +41,7 @@ gettid()
 }
 
 func TestParseMulti(t *testing.T) {
+	t.Parallel()
 	target, err := GetTarget("linux", "amd64")
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +49,7 @@ func TestParseMulti(t *testing.T) {
 	entries := target.ParseLog([]byte(execLog))
 	if len(entries) != 5 {
 		for i, ent := range entries {
-			t.Logf("program #%v: %s\n", i, ent.P)
+			t.Logf("program #%v: %v\n", i, ent.P)
 		}
 		t.Fatalf("got %v programs, want 5", len(entries))
 	}
@@ -107,6 +109,7 @@ munlockall()
 `
 
 func TestParseFault(t *testing.T) {
+	t.Parallel()
 	target, err := GetTarget("linux", "amd64")
 	if err != nil {
 		t.Fatal(err)

@@ -14,18 +14,23 @@ import (
 // typeDesc is arg/field type descriptor.
 type typeDesc struct {
 	Names        []string
-	CanBeArg     bool       // can be argument of syscall?
+	CanBeTypedef bool       // can be type alias target?
 	CantBeOpt    bool       // can't be marked as opt?
-	CantBeRet    bool       // can't be syscall return (directly or indirectly)?
 	NeedBase     bool       // needs base type when used as field?
 	AllowColon   bool       // allow colon (int8:2) on fields?
 	ResourceBase bool       // can be resource base type?
 	OptArgs      int        // number of optional arguments in Args array
 	Args         []namedArg // type arguments
-	// Check does custom verification of the type (optional).
+	// CanBeArgRet returns if this type can be syscall argument/return (false if nil).
+	CanBeArgRet func(comp *compiler, t *ast.Type) (bool, bool)
+	// Check does custom verification of the type (optional, consts are not patched yet).
 	Check func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon)
+	// CheckConsts does custom verification of the type (optional, consts are patched).
+	CheckConsts func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon)
 	// Varlen returns if the type is variable-length (false if not set).
-	Varlen func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) bool
+	Varlen func(comp *compiler, t *ast.Type, args []*ast.Type) bool
+	// ZeroSize returns if the type has static 0 size (false if not set).
+	ZeroSize func(comp *compiler, t *ast.Type, args []*ast.Type) bool
 	// Gen generates corresponding prog.Type.
 	Gen func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type
 }
@@ -36,7 +41,8 @@ type typeArg struct {
 	Kind       int  // int/ident/string
 	AllowColon bool // allow colon (2:3)?
 	// Check does custom verification of the arg (optional).
-	Check func(comp *compiler, t *ast.Type)
+	Check       func(comp *compiler, t *ast.Type)
+	CheckConsts func(comp *compiler, t *ast.Type)
 }
 
 type namedArg struct {
@@ -51,9 +57,13 @@ const (
 	kindString
 )
 
+func canBeArg(comp *compiler, t *ast.Type) (bool, bool)    { return true, false }
+func canBeArgRet(comp *compiler, t *ast.Type) (bool, bool) { return true, true }
+
 var typeInt = &typeDesc{
-	Names:        []string{"int8", "int16", "int32", "int64", "int16be", "int32be", "int64be", "intptr"},
-	CanBeArg:     true,
+	Names:        typeArgBase.Type.Names,
+	CanBeArgRet:  canBeArg,
+	CanBeTypedef: true,
 	AllowColon:   true,
 	ResourceBase: true,
 	OptArgs:      1,
@@ -78,9 +88,10 @@ var typeInt = &typeDesc{
 }
 
 var typePtr = &typeDesc{
-	Names:    []string{"ptr", "ptr64"},
-	CanBeArg: true,
-	Args:     []namedArg{{"direction", typeArgDir}, {"type", typeArgType}},
+	Names:        []string{"ptr", "ptr64"},
+	CanBeArgRet:  canBeArg,
+	CanBeTypedef: true,
+	Args:         []namedArg{{"direction", typeArgDir}, {"type", typeArgType}},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		base.ArgDir = prog.DirIn // pointers are always in
 		base.TypeSize = comp.ptrSize
@@ -94,18 +105,38 @@ var typePtr = &typeDesc{
 	},
 }
 
-var typeArray = &typeDesc{
-	Names:     []string{"array"},
+var typeVoid = &typeDesc{
+	Names:     []string{"void"},
 	CantBeOpt: true,
-	OptArgs:   1,
-	Args:      []namedArg{{"type", typeArgType}, {"size", typeArgRange}},
-	Check: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
+	ZeroSize: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		return true
+	},
+	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
+		base.TypeSize = 0 // the only type with static size 0
+		return &prog.BufferType{
+			TypeCommon: base.TypeCommon,
+			Kind:       prog.BufferBlobRange,
+			RangeBegin: 0,
+			RangeEnd:   0,
+		}
+	},
+}
+
+var typeArray = &typeDesc{
+	Names:        []string{"array"},
+	CanBeTypedef: true,
+	CantBeOpt:    true,
+	OptArgs:      1,
+	Args:         []namedArg{{"type", typeArgType}, {"size", typeArgRange}},
+	CheckConsts: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
 		if len(args) > 1 && args[1].Value == 0 && args[1].Value2 == 0 {
-			// This is the only case that can yield 0 static type size.
 			comp.error(args[1].Pos, "arrays of size 0 are not supported")
 		}
 	},
-	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) bool {
+	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		if comp.isZeroSize(args[0]) {
+			return false
+		}
 		if comp.isVarlen(args[0]) {
 			return true
 		}
@@ -113,6 +144,9 @@ var typeArray = &typeDesc{
 			return args[1].Value != args[1].Value2
 		}
 		return true
+	},
+	ZeroSize: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		return comp.isZeroSize(args[0])
 	},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		elemType := comp.genType(args[0], "", base.ArgDir, false)
@@ -149,34 +183,37 @@ var typeArray = &typeDesc{
 }
 
 var typeLen = &typeDesc{
-	Names:     []string{"len", "bytesize", "bytesize2", "bytesize4", "bytesize8"},
-	CanBeArg:  true,
-	CantBeOpt: true,
-	CantBeRet: true,
-	NeedBase:  true,
-	Args:      []namedArg{{"len target", typeArgLenTarget}},
+	Names:       []string{"len", "bytesize", "bytesize2", "bytesize4", "bytesize8", "bitsize"},
+	CanBeArgRet: canBeArg,
+	CantBeOpt:   true,
+	NeedBase:    true,
+	Args:        []namedArg{{"len target", typeArgLenTarget}},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
-		var byteSize uint64
+		var bitSize uint64
 		switch t.Ident {
 		case "bytesize":
-			byteSize = 1
+			bitSize = 8
 		case "bytesize2", "bytesize4", "bytesize8":
-			byteSize, _ = strconv.ParseUint(t.Ident[8:], 10, 8)
+			byteSize, _ := strconv.ParseUint(t.Ident[8:], 10, 8)
+			bitSize = byteSize * 8
+		case "bitsize":
+			bitSize = 1
 		}
 		return &prog.LenType{
 			IntTypeCommon: base,
 			Buf:           args[0].Ident,
-			ByteSize:      byteSize,
+			BitSize:       bitSize,
 		}
 	},
 }
 
 var typeConst = &typeDesc{
-	Names:     []string{"const"},
-	CanBeArg:  true,
-	CantBeOpt: true,
-	NeedBase:  true,
-	Args:      []namedArg{{"value", typeArgInt}},
+	Names:        []string{"const"},
+	CanBeArgRet:  canBeArg,
+	CanBeTypedef: true,
+	CantBeOpt:    true,
+	NeedBase:     true,
+	Args:         []namedArg{{"value", typeArgInt}},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		return &prog.ConstType{
 			IntTypeCommon: base,
@@ -190,11 +227,12 @@ var typeArgLenTarget = &typeArg{
 }
 
 var typeFlags = &typeDesc{
-	Names:     []string{"flags"},
-	CanBeArg:  true,
-	CantBeOpt: true,
-	NeedBase:  true,
-	Args:      []namedArg{{"flags", typeArgFlags}},
+	Names:        []string{"flags"},
+	CanBeArgRet:  canBeArg,
+	CanBeTypedef: true,
+	CantBeOpt:    true,
+	NeedBase:     true,
+	Args:         []namedArg{{"flags", typeArgFlags}},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		name := args[0].Ident
 		base.TypeName = name
@@ -223,26 +261,11 @@ var typeArgFlags = &typeArg{
 	},
 }
 
-var typeFilename = &typeDesc{
-	Names:     []string{"filename"},
-	CantBeOpt: true,
-	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) bool {
-		return true
-	},
-	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
-		base.TypeSize = 0
-		return &prog.BufferType{
-			TypeCommon: base.TypeCommon,
-			Kind:       prog.BufferFilename,
-		}
-	},
-}
-
 var typeFileoff = &typeDesc{
-	Names:     []string{"fileoff"},
-	CanBeArg:  true,
-	CantBeOpt: true,
-	NeedBase:  true,
+	Names:       []string{"fileoff"},
+	CanBeArgRet: canBeArg,
+	CantBeOpt:   true,
+	NeedBase:    true,
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		return &prog.IntType{
 			IntTypeCommon: base,
@@ -252,10 +275,10 @@ var typeFileoff = &typeDesc{
 }
 
 var typeVMA = &typeDesc{
-	Names:    []string{"vma"},
-	CanBeArg: true,
-	OptArgs:  1,
-	Args:     []namedArg{{"size range", typeArgRange}},
+	Names:       []string{"vma"},
+	CanBeArgRet: canBeArg,
+	OptArgs:     1,
+	Args:        []namedArg{{"size range", typeArgRange}},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		begin, end := uint64(0), uint64(0)
 		if len(args) > 0 {
@@ -270,29 +293,10 @@ var typeVMA = &typeDesc{
 	},
 }
 
-// TODO(dvyukov): perhaps, we need something like typedefs for such types.
-// So that users can introduce them as necessary without modifying compiler:
-// type signalno int32[0:64]
-var typeSignalno = &typeDesc{
-	Names:     []string{"signalno"},
-	CanBeArg:  true,
-	CantBeOpt: true,
-	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
-		base.TypeSize = 4
-		return &prog.IntType{
-			IntTypeCommon: base,
-			Kind:          prog.IntRange,
-			RangeBegin:    0,
-			RangeEnd:      65,
-		}
-	},
-}
-
 var typeCsum = &typeDesc{
 	Names:     []string{"csum"},
 	NeedBase:  true,
 	CantBeOpt: true,
-	CantBeRet: true,
 	OptArgs:   1,
 	Args:      []namedArg{{"csum target", typeArgLenTarget}, {"kind", typeArgCsumType}, {"proto", typeArgInt}},
 	Check: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
@@ -331,12 +335,12 @@ func genCsumKind(t *ast.Type) prog.CsumKind {
 }
 
 var typeProc = &typeDesc{
-	Names:     []string{"proc"},
-	CanBeArg:  true,
-	CantBeOpt: true,
-	NeedBase:  true,
-	Args:      []namedArg{{"range start", typeArgInt}, {"per-proc values", typeArgInt}},
-	Check: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
+	Names:        []string{"proc"},
+	CanBeArgRet:  canBeArg,
+	CanBeTypedef: true,
+	NeedBase:     true,
+	Args:         []namedArg{{"range start", typeArgInt}, {"per-proc values", typeArgInt}},
+	CheckConsts: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
 		start := args[0].Value
 		perProc := args[1].Value
 		if perProc == 0 {
@@ -348,7 +352,7 @@ var typeProc = &typeDesc{
 			const maxPids = 32 // executor knows about this constant (MAX_PIDS)
 			if start >= 1<<size {
 				comp.error(args[0].Pos, "values starting from %v overflow base type", start)
-			} else if start+maxPids*perProc >= 1<<size {
+			} else if start+maxPids*perProc > 1<<size {
 				comp.error(args[0].Pos, "values starting from %v with step %v overflow base type for %v procs",
 					start, perProc, maxPids)
 			}
@@ -367,7 +371,7 @@ var typeText = &typeDesc{
 	Names:     []string{"text"},
 	CantBeOpt: true,
 	Args:      []namedArg{{"kind", typeArgTextType}},
-	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) bool {
+	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
 		return true
 	},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
@@ -388,50 +392,58 @@ var typeArgTextType = &typeArg{
 func genTextType(t *ast.Type) prog.TextKind {
 	switch t.Ident {
 	case "x86_real":
-		return prog.Text_x86_real
+		return prog.TextX86Real
 	case "x86_16":
-		return prog.Text_x86_16
+		return prog.TextX86bit16
 	case "x86_32":
-		return prog.Text_x86_32
+		return prog.TextX86bit32
 	case "x86_64":
-		return prog.Text_x86_64
+		return prog.TextX86bit64
 	case "arm64":
-		return prog.Text_arm64
+		return prog.TextArm64
 	default:
 		panic(fmt.Sprintf("unknown text type %q", t.Ident))
 	}
 }
 
 var typeBuffer = &typeDesc{
-	Names:    []string{"buffer"},
-	CanBeArg: true,
-	Args:     []namedArg{{"direction", typeArgDir}},
+	Names:       []string{"buffer"},
+	CanBeArgRet: canBeArg,
+	Args:        []namedArg{{"direction", typeArgDir}},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		base.TypeSize = comp.ptrSize
+		common := genCommon("", "", 0, genDir(args[0]), false)
+		// BufferBlobRand is always varlen.
+		common.IsVarlen = true
 		return &prog.PtrType{
 			TypeCommon: base.TypeCommon,
 			Type: &prog.BufferType{
-				// BufferBlobRand is always varlen.
-				TypeCommon: genCommon("", "", 0, genDir(args[0]), false),
+				TypeCommon: common,
 				Kind:       prog.BufferBlobRand,
 			},
 		}
 	},
 }
 
+const (
+	stringnoz = "stringnoz"
+)
+
 var typeString = &typeDesc{
-	Names:   []string{"string"},
-	OptArgs: 2,
-	Args:    []namedArg{{"literal or flags", typeArgStringFlags}, {"size", typeArgInt}},
+	Names:        []string{"string", stringnoz},
+	CanBeTypedef: true,
+	OptArgs:      2,
+	Args:         []namedArg{{"literal or flags", typeArgStringFlags}, {"size", typeArgInt}},
 	Check: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
+		if t.Ident == stringnoz && len(args) > 1 {
+			comp.error(args[0].Pos, "fixed-size string can't be non-zero-terminated")
+		}
+	},
+	CheckConsts: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
 		if len(args) > 1 {
 			size := args[1].Value
-			vals := []string{args[0].String}
-			if args[0].Ident != "" {
-				vals = genStrArray(comp.strFlags[args[0].Ident].Values)
-			}
+			vals := comp.genStrings(t, args)
 			for _, s := range vals {
-				s += "\x00"
 				if uint64(len(s)) > size {
 					comp.error(args[0].Pos, "string value %q exceeds buffer length %v",
 						s, size)
@@ -439,55 +451,90 @@ var typeString = &typeDesc{
 			}
 		}
 	},
-	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) bool {
-		return comp.stringSize(args) == 0
+	Varlen: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		return comp.stringSize(t, args) == varlenString
+	},
+	ZeroSize: func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		return comp.stringSize(t, args) == 0
 	},
 	Gen: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
+		if len(args) > 0 && args[0].Ident == "filename" {
+			base.TypeName = "filename"
+			base.TypeSize = 0
+			if len(args) >= 2 {
+				base.TypeSize = args[1].Value
+			}
+			return &prog.BufferType{
+				TypeCommon: base.TypeCommon,
+				Kind:       prog.BufferFilename,
+				NoZ:        t.Ident == stringnoz,
+			}
+		}
 		subkind := ""
-		var vals []string
-		if len(args) > 0 {
-			if args[0].String != "" {
-				vals = append(vals, args[0].String)
-			} else {
-				subkind = args[0].Ident
-				vals = genStrArray(comp.strFlags[subkind].Values)
-			}
+		if len(args) > 0 && args[0].Ident != "" {
+			subkind = args[0].Ident
 		}
-		var size uint64
-		if len(args) > 1 {
-			size = args[1].Value
+		vals := comp.genStrings(t, args)
+		base.TypeSize = comp.stringSize(t, args)
+		if base.TypeSize == varlenString {
+			base.TypeSize = 0
 		}
-		for i, s := range vals {
-			s += "\x00"
-			for uint64(len(s)) < size {
-				s += "\x00"
-			}
-			vals[i] = s
-		}
-		base.TypeSize = comp.stringSize(args)
 		return &prog.BufferType{
 			TypeCommon: base.TypeCommon,
 			Kind:       prog.BufferString,
 			SubKind:    subkind,
 			Values:     vals,
+			NoZ:        t.Ident == stringnoz,
 		}
 	},
 }
 
-// stringSize returns static string size, or 0 if it is variable length.
-func (comp *compiler) stringSize(args []*ast.Type) uint64 {
+func (comp *compiler) genStrings(t *ast.Type, args []*ast.Type) []string {
+	var vals []string
+	if len(args) > 0 {
+		if args[0].HasString {
+			vals = append(vals, args[0].String)
+		} else {
+			vals = genStrArray(comp.strFlags[args[0].Ident].Values)
+		}
+	}
+	if t.Ident == stringnoz {
+		return vals
+	}
+	var size uint64
+	if len(args) > 1 {
+		size = args[1].Value
+	}
+	for i, s := range vals {
+		s += "\x00"
+		for uint64(len(s)) < size {
+			s += "\x00"
+		}
+		vals[i] = s
+	}
+	return vals
+}
+
+const varlenString = ^uint64(0)
+
+// stringSize returns static string size, or varlenString if it is variable length.
+func (comp *compiler) stringSize(t *ast.Type, args []*ast.Type) uint64 {
 	switch len(args) {
 	case 0:
-		return 0 // a random string
+		return varlenString // a random string
 	case 1:
-		if args[0].String != "" {
-			return uint64(len(args[0].String)) + 1 // string constant
+		var z uint64
+		if t.Ident == "string" {
+			z = 1
 		}
-		var size uint64
+		if args[0].HasString {
+			return uint64(len(args[0].String)) + z // string constant
+		}
+		size := varlenString
 		for _, s := range comp.strFlags[args[0].Ident].Values {
-			s1 := uint64(len(s.Value)) + 1
-			if size != 0 && size != s1 {
-				return 0 // strings of different lengths
+			s1 := uint64(len(s.Value)) + z
+			if size != varlenString && size != s1 {
+				return varlenString // strings of different lengths
 			}
 			size = s1
 		}
@@ -501,7 +548,7 @@ func (comp *compiler) stringSize(args []*ast.Type) uint64 {
 
 var typeArgStringFlags = &typeArg{
 	Check: func(comp *compiler, t *ast.Type) {
-		if t.String == "" && t.Ident == "" {
+		if !t.HasString && t.Ident == "" {
 			comp.error(t.Pos, "unexpected int %v, string arg must be a string literal or string flags", t.Value)
 			return
 		}
@@ -513,15 +560,11 @@ var typeArgStringFlags = &typeArg{
 }
 
 // typeArgType is used as placeholder for any type (e.g. ptr target type).
-var typeArgType = &typeArg{
-	Check: func(comp *compiler, t *ast.Type) {
-		panic("must not be called")
-	},
-}
+var typeArgType = &typeArg{}
 
 var typeResource = &typeDesc{
-	// No Names, but compiler knows how to match it.
-	CanBeArg:     true,
+	// No Names, but getTypeDesc knows how to match it.
+	CanBeArgRet:  canBeArgRet,
 	ResourceBase: true,
 	// Gen is assigned below to avoid initialization loop.
 }
@@ -542,24 +585,55 @@ func init() {
 }
 
 var typeStruct = &typeDesc{
-	// No Names, but compiler knows how to match it.
-	CantBeOpt: true,
+	// No Names, but getTypeDesc knows how to match it.
+	CantBeOpt:    true,
+	CanBeTypedef: true,
 	// Varlen/Gen are assigned below due to initialization cycle.
 }
 
 func init() {
-	typeStruct.Varlen = func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) bool {
-		return comp.isStructVarlen(t.Ident)
+	typeStruct.CanBeArgRet = func(comp *compiler, t *ast.Type) (bool, bool) {
+		// Allow unions to be arg if all options can be arg.
+		s := comp.structs[t.Ident]
+		if !s.IsUnion {
+			return false, false
+		}
+		canBeArg := true
+		for _, fld := range s.Fields {
+			desc := comp.getTypeDesc(fld.Type)
+			if desc == nil || desc.CanBeArgRet == nil {
+				return false, false
+			}
+			canBeArg1, _ := desc.CanBeArgRet(comp, fld.Type)
+			if !canBeArg1 {
+				canBeArg = false
+			}
+		}
+		return canBeArg, false
+	}
+	typeStruct.Varlen = func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		return comp.structIsVarlen(t.Ident)
+	}
+	typeStruct.ZeroSize = func(comp *compiler, t *ast.Type, args []*ast.Type) bool {
+		for _, fld := range comp.structs[t.Ident].Fields {
+			if !comp.isZeroSize(fld.Type) {
+				return false
+			}
+		}
+		return true
 	}
 	typeStruct.Gen = func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) prog.Type {
 		s := comp.structs[t.Ident]
-		key := prog.StructKey{t.Ident, base.ArgDir}
+		key := prog.StructKey{
+			Name: t.Ident,
+			Dir:  base.ArgDir,
+		}
 		desc := comp.structDescs[key]
 		if desc == nil {
 			// Need to assign to structDescs before calling genStructDesc to break recursion.
 			desc = new(prog.StructDesc)
 			comp.structDescs[key] = desc
-			comp.genStructDesc(desc, s, base.ArgDir)
+			comp.genStructDesc(desc, s, base.ArgDir, typeStruct.Varlen(comp, t, args))
 		}
 		if s.IsUnion {
 			return &prog.UnionType{
@@ -567,14 +641,20 @@ func init() {
 				FldName:    base.FldName,
 				StructDesc: desc,
 			}
-		} else {
-			return &prog.StructType{
-				Key:        key,
-				FldName:    base.FldName,
-				StructDesc: desc,
-			}
+		}
+		return &prog.StructType{
+			Key:        key,
+			FldName:    base.FldName,
+			StructDesc: desc,
 		}
 	}
+}
+
+var typeTypedef = &typeDesc{
+	// No Names, but getTypeDesc knows how to match it.
+	Check: func(comp *compiler, t *ast.Type, args []*ast.Type, base prog.IntTypeCommon) {
+		panic("must not be called")
+	},
 }
 
 var typeArgDir = &typeArg{
@@ -602,7 +682,7 @@ var typeArgInt = &typeArg{
 var typeArgRange = &typeArg{
 	Kind:       kindInt,
 	AllowColon: true,
-	Check: func(comp *compiler, t *ast.Type) {
+	CheckConsts: func(comp *compiler, t *ast.Type) {
 		if !t.HasColon {
 			t.Value2 = t.Value
 		}
@@ -620,6 +700,10 @@ var typeArgBase = namedArg{
 		AllowColon: true,
 		Check: func(comp *compiler, t *ast.Type) {
 			if t.HasColon {
+				if t.Ident2 != "" {
+					comp.error(t.Pos2, "literal const bitfield sizes are not supported")
+					return
+				}
 				if t.Value2 == 0 {
 					// This was not supported historically
 					// and does not work the way C bitfields of size 0 work.
@@ -638,7 +722,9 @@ var typeArgBase = namedArg{
 }
 
 var (
-	builtinTypes = make(map[string]*typeDesc)
+	builtinTypes    = make(map[string]*typeDesc)
+	builtinTypedefs = make(map[string]*ast.TypeDef)
+	builtinStrFlags = make(map[string]*ast.StrFlags)
 
 	// To avoid weird cases like ptr[in, in] and ptr[out, opt].
 	reservedName = map[string]bool{
@@ -649,25 +735,38 @@ var (
 	}
 )
 
+const builtinDefs = `
+type bool8 int8[0:1]
+type bool16 int16[0:1]
+type bool32 int32[0:1]
+type bool64 int64[0:1]
+type boolptr intptr[0:1]
+
+type filename string[filename]
+filename = "", "."
+
+type optional[T] [
+	val	T
+	void	void
+] [varlen]
+`
+
 func init() {
 	builtins := []*typeDesc{
 		typeInt,
 		typePtr,
+		typeVoid,
 		typeArray,
 		typeLen,
 		typeConst,
 		typeFlags,
-		typeFilename,
 		typeFileoff,
 		typeVMA,
-		typeSignalno,
 		typeCsum,
 		typeProc,
 		typeText,
 		typeBuffer,
 		typeString,
-		typeResource,
-		typeStruct,
 	}
 	for _, desc := range builtins {
 		for _, name := range desc.Names {
@@ -675,6 +774,20 @@ func init() {
 				panic(fmt.Sprintf("duplicate builtin type %q", name))
 			}
 			builtinTypes[name] = desc
+		}
+	}
+	builtinDesc := ast.Parse([]byte(builtinDefs), "builtins", func(pos ast.Pos, msg string) {
+		panic(fmt.Sprintf("failed to parse builtins: %v: %v", pos, msg))
+	})
+	for _, decl := range builtinDesc.Nodes {
+		switch n := decl.(type) {
+		case *ast.TypeDef:
+			builtinTypedefs[n.Name.Name] = n
+		case *ast.StrFlags:
+			builtinStrFlags[n.Name.Name] = n
+		case *ast.NewLine:
+		default:
+			panic(fmt.Sprintf("unexpected node in builtins: %#v", n))
 		}
 	}
 }

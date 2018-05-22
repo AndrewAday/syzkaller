@@ -1,7 +1,7 @@
 // Copyright 2017 syzkaller project authors. All rights reserved.
 // Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-// package dashapi defines data structures used in dashboard communication
+// Package dashapi defines data structures used in dashboard communication
 // and provides client interface.
 package dashapi
 
@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"reflect"
 	"strings"
+	"time"
 )
 
 type Dashboard struct {
@@ -34,18 +35,26 @@ func New(client, addr, key string) *Dashboard {
 
 // Build describes all aspects of a kernel build.
 type Build struct {
-	Manager         string
-	ID              string
-	OS              string
-	Arch            string
-	VMArch          string
-	SyzkallerCommit string
-	CompilerID      string
-	KernelRepo      string
-	KernelBranch    string
-	KernelCommit    string
-	KernelConfig    []byte
-	Commits         []string // see BuilderPoll
+	Manager           string
+	ID                string
+	OS                string
+	Arch              string
+	VMArch            string
+	SyzkallerCommit   string
+	CompilerID        string
+	KernelRepo        string
+	KernelBranch      string
+	KernelCommit      string
+	KernelCommitTitle string
+	KernelCommitDate  time.Time
+	KernelConfig      []byte
+	Commits           []string // see BuilderPoll
+	FixCommits        []FixCommit
+}
+
+type FixCommit struct {
+	Title string
+	BugID string
 }
 
 func (dash *Dashboard) UploadBuild(build *Build) error {
@@ -53,10 +62,12 @@ func (dash *Dashboard) UploadBuild(build *Build) error {
 }
 
 // BuilderPoll request is done by kernel builder before uploading a new build
-// with UploadBuild request. Response contains list of commits that dashboard
-// is interested in (i.e. commits that fix open bugs). When uploading a new
-// build builder should pass subset of the commits that are present in the build
-// in Build.Commits field.
+// with UploadBuild request. Response contains list of commit titles that
+// dashboard is interested in (i.e. commits that fix open bugs) and email that
+// appears in Reported-by tags for bug ID extraction. When uploading a new build
+// builder will pass subset of the commit titles that are present in the build
+// in Build.Commits field and list of {bug ID, commit title} pairs extracted
+// from git log.
 
 type BuilderPollReq struct {
 	Manager string
@@ -64,6 +75,7 @@ type BuilderPollReq struct {
 
 type BuilderPollResp struct {
 	PendingCommits []string
+	ReportEmail    string
 }
 
 func (dash *Dashboard) BuilderPoll(manager string) (*BuilderPollResp, error) {
@@ -75,10 +87,66 @@ func (dash *Dashboard) BuilderPoll(manager string) (*BuilderPollResp, error) {
 	return resp, err
 }
 
+// Jobs workflow:
+//   - syz-ci sends JobPollReq periodically to check for new jobs,
+//     request contains list of managers that this syz-ci runs.
+//   - dashboard replies with JobPollResp that contains job details,
+//     if no new jobs available ID is set to empty string.
+//   - when syz-ci finishes the job, it sends JobDoneReq which contains
+//     job execution result (Build, Crash or Error details),
+//     ID must match JobPollResp.ID.
+
+type JobPollReq struct {
+	Managers []string
+}
+
+type JobPollResp struct {
+	ID              string
+	Manager         string
+	KernelRepo      string
+	KernelBranch    string
+	KernelConfig    []byte
+	SyzkallerCommit string
+	Patch           []byte
+	ReproOpts       []byte
+	ReproSyz        []byte
+	ReproC          []byte
+}
+
+type JobDoneReq struct {
+	ID          string
+	Build       Build
+	Error       []byte
+	CrashTitle  string
+	CrashLog    []byte
+	CrashReport []byte
+}
+
+func (dash *Dashboard) JobPoll(managers []string) (*JobPollResp, error) {
+	req := &JobPollReq{Managers: managers}
+	resp := new(JobPollResp)
+	err := dash.query("job_poll", req, resp)
+	return resp, err
+}
+
+func (dash *Dashboard) JobDone(req *JobDoneReq) error {
+	return dash.query("job_done", req, nil)
+}
+
+type BuildErrorReq struct {
+	Build Build
+	Crash Crash
+}
+
+func (dash *Dashboard) ReportBuildError(req *BuildErrorReq) error {
+	return dash.query("report_build_error", req, nil)
+}
+
 // Crash describes a single kernel crash (potentially with repro).
 type Crash struct {
 	BuildID     string // refers to Build.ID
 	Title       string
+	Corrupted   bool // report is corrupted (corrupted title, no stacks, etc)
 	Maintainers []string
 	Log         []byte
 	Report      []byte
@@ -98,10 +166,11 @@ func (dash *Dashboard) ReportCrash(crash *Crash) (*ReportCrashResp, error) {
 	return resp, err
 }
 
-// CrashID is a short summary of a crash for repro queires.
+// CrashID is a short summary of a crash for repro queries.
 type CrashID struct {
-	BuildID string
-	Title   string
+	BuildID   string
+	Title     string
+	Corrupted bool
 }
 
 type NeedReproResp struct {
@@ -137,25 +206,44 @@ func (dash *Dashboard) LogError(name, msg string, args ...interface{}) {
 // BugReport describes a single bug.
 // Used by dashboard external reporting.
 type BugReport struct {
-	Config       []byte
-	ID           string
-	ExtID        string // arbitrary reporting ID forwarded from BugUpdate.ExtID
-	First        bool   // Set for first report for this bug.
-	Title        string
-	Maintainers  []string
-	CC           []string // additional CC emails
-	OS           string
-	Arch         string
-	VMArch       string
-	CompilerID   string
-	KernelRepo   string
-	KernelBranch string
-	KernelCommit string
-	KernelConfig []byte
-	Log          []byte
-	Report       []byte
-	ReproC       []byte
-	ReproSyz     []byte
+	Namespace         string
+	Config            []byte
+	ID                string
+	JobID             string
+	ExtID             string // arbitrary reporting ID forwarded from BugUpdate.ExtID
+	First             bool   // Set for first report for this bug.
+	Title             string
+	Maintainers       []string
+	CC                []string // additional CC emails
+	OS                string
+	Arch              string
+	VMArch            string
+	CompilerID        string
+	KernelRepo        string
+	KernelRepoAlias   string
+	KernelBranch      string
+	KernelCommit      string
+	KernelCommitTitle string
+	KernelCommitDate  time.Time
+	KernelConfig      []byte
+	KernelConfigLink  string
+	Log               []byte
+	LogLink           string
+	Report            []byte
+	ReportLink        string
+	ReproC            []byte
+	ReproCLink        string
+	ReproSyz          []byte
+	ReproSyzLink      string
+	CrashID           int64 // returned back in BugUpdate
+	NumCrashes        int64
+	HappenedOn        []string // list of kernel repo aliases
+
+	CrashTitle string // job execution crash title
+	Error      []byte // job execution error
+	ErrorLink  string
+	Patch      []byte // testing job patch
+	PatchLink  string
 }
 
 type BugUpdate struct {
@@ -167,19 +255,51 @@ type BugUpdate struct {
 	DupOf      string
 	FixCommits []string // Titles of commits that fix this bug.
 	CC         []string // Additional emails to add to CC list in future emails.
+	CrashID    int64
 }
 
 type BugUpdateReply struct {
-	OK   bool
-	Text string
+	// Bug update can fail for 2 reason:
+	//  - update does not pass logical validataion, in this case OK=false
+	//  - internal/datastore error, in this case Error=true
+	OK    bool
+	Error bool
+	Text  string
 }
 
-type PollRequest struct {
+type PollBugsRequest struct {
 	Type string
 }
 
-type PollResponse struct {
+type PollBugsResponse struct {
 	Reports []*BugReport
+}
+
+type PollClosedRequest struct {
+	IDs []string
+}
+
+type PollClosedResponse struct {
+	IDs []string
+}
+
+type ManagerStatsReq struct {
+	Name string
+	Addr string
+
+	// Current level:
+	UpTime time.Duration
+	Corpus uint64
+	Cover  uint64
+
+	// Delta since last sync:
+	FuzzingTime time.Duration
+	Crashes     uint64
+	Execs       uint64
+}
+
+func (dash *Dashboard) UploadManagerStats(req *ManagerStatsReq) error {
+	return dash.query("manager_stats", req, nil)
 }
 
 type (
@@ -226,41 +346,26 @@ func Query(client, addr, key, method string, ctor RequestCtor, doer RequestDoer,
 	values.Add("client", client)
 	values.Add("key", key)
 	values.Add("method", method)
-	var body io.Reader
-	gzipped := false
 	if req != nil {
 		data, err := json.Marshal(req)
 		if err != nil {
 			return fmt.Errorf("failed to marshal request: %v", err)
 		}
-		if len(data) < 100 || addr == "" || strings.HasPrefix(addr, "http://localhost:") {
-			// Don't bother compressing tiny requests.
-			// Don't compress for dev_appserver which does not support gzip.
-			body = bytes.NewReader(data)
-		} else {
-			buf := new(bytes.Buffer)
-			gz := gzip.NewWriter(buf)
-			if _, err := gz.Write(data); err != nil {
-				return err
-			}
-			if err := gz.Close(); err != nil {
-				return err
-			}
-			body = buf
-			gzipped = true
+		buf := new(bytes.Buffer)
+		gz := gzip.NewWriter(buf)
+		if _, err := gz.Write(data); err != nil {
+			return err
 		}
+		if err := gz.Close(); err != nil {
+			return err
+		}
+		values.Add("payload", buf.String())
 	}
-	url := fmt.Sprintf("%v/api?%v", addr, values.Encode())
-	r, err := ctor("POST", url, body)
+	r, err := ctor("POST", fmt.Sprintf("%v/api", addr), strings.NewReader(values.Encode()))
 	if err != nil {
 		return err
 	}
-	if body != nil {
-		r.Header.Set("Content-Type", "application/json")
-		if gzipped {
-			r.Header.Set("Content-Encoding", "gzip")
-		}
-	}
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	resp, err := doer(r)
 	if err != nil {
 		return fmt.Errorf("http request failed: %v", err)

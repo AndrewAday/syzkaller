@@ -5,9 +5,17 @@
 
 #include <windows.h>
 
-#define doexit exit
-#define NORETURN
-#define SYSCALLAPI WINAPI
+#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||      \
+    defined(SYZ_USE_TMP_DIR) || defined(SYZ_HANDLE_SEGV) || defined(SYZ_TUN_ENABLE) || \
+    defined(SYZ_SANDBOX_NAMESPACE) || defined(SYZ_SANDBOX_SETUID) ||                   \
+    defined(SYZ_SANDBOX_NONE) || defined(SYZ_FAULT_INJECTION) || defined(__NR_syz_kvm_setup_cpu)
+__attribute__((noreturn)) static void doexit(int status)
+{
+	_exit(status);
+	for (;;) {
+	}
+}
+#endif
 
 #include "common.h"
 
@@ -25,14 +33,14 @@ static void install_segv_handler()
 #endif
 
 #if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
-static uint64_t current_time_ms()
+static uint64 current_time_ms()
 {
 	return GetTickCount64();
 }
 #endif
 
 #if defined(SYZ_EXECUTOR)
-static void sleep_ms(uint64_t ms)
+static void sleep_ms(uint64 ms)
 {
 	Sleep(ms);
 }

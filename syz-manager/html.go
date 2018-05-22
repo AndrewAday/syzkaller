@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"html/template"
 	"io"
@@ -20,77 +21,62 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
-	"github.com/google/syzkaller/pkg/report"
 )
 
 const dateFormat = "Jan 02 2006 15:04:05 MST"
 
-func (mgr *Manager) initHttp() {
+func (mgr *Manager) initHTTP() {
 	http.HandleFunc("/", mgr.httpSummary)
+	http.HandleFunc("/syscalls", mgr.httpSyscalls)
 	http.HandleFunc("/corpus", mgr.httpCorpus)
 	http.HandleFunc("/crash", mgr.httpCrash)
 	http.HandleFunc("/cover", mgr.httpCover)
 	http.HandleFunc("/prio", mgr.httpPrio)
 	http.HandleFunc("/file", mgr.httpFile)
 	http.HandleFunc("/report", mgr.httpReport)
+	http.HandleFunc("/rawcover", mgr.httpRawCover)
+	// Browsers like to request this, without special handler this goes to / handler.
+	http.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {})
 
-	ln, err := net.Listen("tcp4", mgr.cfg.Http)
+	ln, err := net.Listen("tcp4", mgr.cfg.HTTP)
 	if err != nil {
-		Fatalf("failed to listen on %v: %v", mgr.cfg.Http, err)
+		log.Fatalf("failed to listen on %v: %v", mgr.cfg.HTTP, err)
 	}
-	Logf(0, "serving http on http://%v", ln.Addr())
+	log.Logf(0, "serving http on http://%v", ln.Addr())
 	go func() {
 		err := http.Serve(ln, nil)
-		Fatalf("failed to serve http: %v", err)
+		log.Fatalf("failed to serve http: %v", err)
 	}()
 }
 
 func (mgr *Manager) httpSummary(w http.ResponseWriter, r *http.Request) {
 	data := &UISummaryData{
-		Name: mgr.cfg.Name,
+		Name:  mgr.cfg.Name,
+		Log:   log.CachedLogOutput(),
+		Stats: mgr.collectStats(),
 	}
 
 	var err error
-	if data.Crashes, err = collectCrashes(mgr.cfg.Workdir); err != nil {
+	if data.Crashes, err = mgr.collectCrashes(mgr.cfg.Workdir); err != nil {
 		http.Error(w, fmt.Sprintf("failed to collect crashes: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	mgr.mu.Lock()
-	defer mgr.mu.Unlock()
 
-	data.Stats = append(data.Stats, UIStat{Name: "uptime", Value: fmt.Sprint(time.Since(mgr.startTime) / 1e9 * 1e9)})
-	data.Stats = append(data.Stats, UIStat{Name: "fuzzing", Value: fmt.Sprint(mgr.fuzzingTime / 60e9 * 60e9)})
-	data.Stats = append(data.Stats, UIStat{Name: "corpus", Value: fmt.Sprint(len(mgr.corpus))})
-	data.Stats = append(data.Stats, UIStat{Name: "triage queue", Value: fmt.Sprint(len(mgr.candidates))})
-	data.Stats = append(data.Stats, UIStat{Name: "cover", Value: fmt.Sprint(len(mgr.corpusCover)), Link: "/cover"})
-	data.Stats = append(data.Stats, UIStat{Name: "lineage cover", Value: fmt.Sprint(len(mgr.lineageCover))})
-	data.Stats = append(data.Stats, UIStat{Name: "signal", Value: fmt.Sprint(len(mgr.corpusSignal))})
-
-	type CallCov struct {
-		count int
-		cov   cover.Cover
+	if err := summaryTemplate.Execute(w, data); err != nil {
+		http.Error(w, fmt.Sprintf("failed to execute template: %v", err),
+			http.StatusInternalServerError)
+		return
 	}
-	calls := make(map[string]*CallCov)
-	for _, inp := range mgr.corpus {
-		if calls[inp.Call] == nil {
-			calls[inp.Call] = new(CallCov)
-		}
-		cc := calls[inp.Call]
-		cc.count++
-		cc.cov = cover.Union(cc.cov, cover.Cover(inp.Cover))
-	}
+}
 
-	secs := uint64(1)
-	if !mgr.firstConnect.IsZero() {
-		secs = uint64(time.Since(mgr.firstConnect))/1e9 + 1
+func (mgr *Manager) httpSyscalls(w http.ResponseWriter, r *http.Request) {
+	data := &UISyscallsData{
+		Name: mgr.cfg.Name,
 	}
-
-	var cov cover.Cover
-	for c, cc := range calls {
-		cov = cover.Union(cov, cc.cov)
+	for c, cc := range mgr.collectSyscallInfo() {
 		data.Calls = append(data.Calls, UICallType{
 			Name:   c,
 			Inputs: cc.count,
@@ -98,6 +84,37 @@ func (mgr *Manager) httpSummary(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	sort.Sort(UICallTypeArray(data.Calls))
+
+	if err := syscallsTemplate.Execute(w, data); err != nil {
+		http.Error(w, fmt.Sprintf("failed to execute template: %v", err),
+			http.StatusInternalServerError)
+		return
+	}
+}
+
+type CallCov struct {
+	count int
+	cov   cover.Cover
+}
+
+func (mgr *Manager) collectStats() []UIStat {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	var stats []UIStat
+	stats = append(stats, UIStat{Name: "uptime", Value: fmt.Sprint(time.Since(mgr.startTime) / 1e9 * 1e9)})
+	stats = append(stats, UIStat{Name: "fuzzing", Value: fmt.Sprint(mgr.fuzzingTime / 60e9 * 60e9)})
+	stats = append(stats, UIStat{Name: "corpus", Value: fmt.Sprint(len(mgr.corpus))})
+	stats = append(stats, UIStat{Name: "triage queue", Value: fmt.Sprint(len(mgr.candidates))})
+	stats = append(stats, UIStat{Name: "cover", Value: fmt.Sprint(len(mgr.corpusCover)), Link: "/cover"})
+	stats = append(stats, UIStat{Name: "lineage cover", Value: fmt.Sprint(len(mgr.lineageCover))})
+	stats = append(stats, UIStat{Name: "signal", Value: fmt.Sprint(mgr.corpusSignal.Len())})
+	stats = append(stats, UIStat{Name: "syscalls", Value: fmt.Sprint(len(mgr.enabledCalls)), Link: "/syscalls"})
+
+	secs := uint64(1)
+	if !mgr.firstConnect.IsZero() {
+		secs = uint64(time.Since(mgr.firstConnect))/1e9 + 1
+	}
 
 	var intStats []UIStat
 	for k, v := range mgr.stats {
@@ -113,18 +130,29 @@ func (mgr *Manager) httpSummary(w http.ResponseWriter, r *http.Request) {
 		intStats = append(intStats, UIStat{Name: k, Value: val})
 	}
 	sort.Sort(UIStatArray(intStats))
-	data.Stats = append(data.Stats, intStats...)
-	data.Log = CachedLogOutput()
+	stats = append(stats, intStats...)
+	return stats
+}
 
-	if err := summaryTemplate.Execute(w, data); err != nil {
-		http.Error(w, fmt.Sprintf("failed to execute template: %v", err), http.StatusInternalServerError)
-		return
+func (mgr *Manager) collectSyscallInfo() map[string]*CallCov {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	calls := make(map[string]*CallCov)
+	for _, inp := range mgr.corpus {
+		if calls[inp.Call] == nil {
+			calls[inp.Call] = new(CallCov)
+		}
+		cc := calls[inp.Call]
+		cc.count++
+		cc.cov.Merge(inp.Cover)
 	}
+	return calls
 }
 
 func (mgr *Manager) httpCrash(w http.ResponseWriter, r *http.Request) {
 	crashID := r.FormValue("id")
-	crash := readCrash(mgr.cfg.Workdir, crashID, true)
+	crash := readCrash(mgr.cfg.Workdir, crashID, nil, true)
 	if crash == nil {
 		http.Error(w, fmt.Sprintf("failed to read crash info"), http.StatusInternalServerError)
 		return
@@ -175,17 +203,17 @@ func (mgr *Manager) httpCover(w http.ResponseWriter, r *http.Request) {
 	}
 	var cov cover.Cover
 	if sig := r.FormValue("input"); sig != "" {
-		cov = mgr.corpus[sig].Cover
+		cov.Merge(mgr.corpus[sig].Cover)
 	} else {
 		call := r.FormValue("call")
 		for _, inp := range mgr.corpus {
 			if call == "" || call == inp.Call {
-				cov = cover.Union(cov, cover.Cover(inp.Cover))
+				cov.Merge(inp.Cover)
 			}
 		}
 	}
 
-	if err := generateCoverHtml(w, mgr.cfg.Vmlinux, cov); err != nil {
+	if err := generateCoverHTML(w, mgr.cfg.Vmlinux, mgr.cfg.TargetVMArch, cov); err != nil {
 		http.Error(w, fmt.Sprintf("failed to generate coverage profile: %v", err), http.StatusInternalServerError)
 		return
 	}
@@ -262,16 +290,6 @@ func (mgr *Manager) httpReport(w http.ResponseWriter, r *http.Request) {
 	}
 	fmt.Fprintf(w, "Syzkaller hit '%s' bug%s.\n\n", trimNewLines(desc), commitDesc)
 	if len(rep) != 0 {
-		guiltyFile := report.ExtractGuiltyFile(rep)
-		if guiltyFile != "" {
-			fmt.Fprintf(w, "Guilty file: %v\n\n", guiltyFile)
-			maintainers, err := report.GetMaintainers(mgr.cfg.Kernel_Src, guiltyFile)
-			if err == nil {
-				fmt.Fprintf(w, "Maintainers: %v\n\n", maintainers)
-			} else {
-				fmt.Fprintf(w, "Failed to extract maintainers: %v\n\n", err)
-			}
-		}
 		fmt.Fprintf(w, "%s\n\n", rep)
 	}
 	if len(prog) == 0 && len(cprog) == 0 {
@@ -290,7 +308,44 @@ func (mgr *Manager) httpReport(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func collectCrashes(workdir string) ([]*UICrashType, error) {
+func (mgr *Manager) httpRawCover(w http.ResponseWriter, r *http.Request) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	base, err := getVMOffset(mgr.cfg.Vmlinux)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to get vmlinux base: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	var cov cover.Cover
+	for _, inp := range mgr.corpus {
+		cov.Merge(inp.Cover)
+	}
+	pcs := make([]uint64, 0, len(cov))
+	for pc := range cov {
+		fullPC := cover.RestorePC(pc, base)
+		prevPC := previousInstructionPC(mgr.cfg.TargetVMArch, fullPC)
+		pcs = append(pcs, prevPC)
+	}
+	sort.Slice(pcs, func(i, j int) bool {
+		return pcs[i] < pcs[j]
+	})
+
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	buf := bufio.NewWriter(w)
+	for _, pc := range pcs {
+		fmt.Fprintf(buf, "0x%x\n", pc)
+	}
+	buf.Flush()
+}
+
+func (mgr *Manager) collectCrashes(workdir string) ([]*UICrashType, error) {
+	// Note: mu is not locked here.
+	reproReply := make(chan map[string]bool)
+	mgr.reproRequest <- reproReply
+	repros := <-reproReply
+
 	crashdir := filepath.Join(workdir, "crashes")
 	dirs, err := osutil.ListDir(crashdir)
 	if err != nil {
@@ -298,7 +353,7 @@ func collectCrashes(workdir string) ([]*UICrashType, error) {
 	}
 	var crashTypes []*UICrashType
 	for _, dir := range dirs {
-		crash := readCrash(workdir, dir, false)
+		crash := readCrash(workdir, dir, repros, false)
 		if crash != nil {
 			crashTypes = append(crashTypes, crash)
 		}
@@ -307,7 +362,7 @@ func collectCrashes(workdir string) ([]*UICrashType, error) {
 	return crashTypes, nil
 }
 
-func readCrash(workdir, dir string, full bool) *UICrashType {
+func readCrash(workdir, dir string, repros map[string]bool, full bool) *UICrashType {
 	if len(dir) != 40 {
 		return nil
 	}
@@ -382,6 +437,8 @@ func readCrash(workdir, dir string, full bool) *UICrashType {
 		} else {
 			triaged = "has repro"
 		}
+	} else if repros[string(desc)] {
+		triaged = "reproducing"
 	} else if reproAttempts >= maxReproAttempts {
 		triaged = "non-reproducible"
 	}
@@ -405,9 +462,13 @@ func trimNewLines(data []byte) []byte {
 type UISummaryData struct {
 	Name    string
 	Stats   []UIStat
-	Calls   []UICallType
 	Crashes []*UICrashType
 	Log     string
+}
+
+type UISyscallsData struct {
+	Name  string
+	Calls []UICallType
 }
 
 type UICrashType struct {
@@ -537,9 +598,17 @@ var summaryTemplate = template.Must(template.New("").Parse(addStyle(`
 	var textarea = document.getElementById("log_textarea");
 	textarea.scrollTop = textarea.scrollHeight;
 </script>
-<br>
-<br>
+</body></html>
+`)))
 
+var syscallsTemplate = template.Must(template.New("").Parse(addStyle(`
+<!doctype html>
+<html>
+<head>
+	<title>{{.Name }} syzkaller</title>
+	{{STYLE}}
+</head>
+<body>
 <b>Per-call coverage:</b>
 <br>
 {{range $c := $.Calls}}

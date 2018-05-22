@@ -14,39 +14,22 @@
 
 #include "syscalls_windows.h"
 
-char input_data[kMaxInput];
-uint32_t output;
+uint32 output;
 
 int main(int argc, char** argv)
 {
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
-		puts("linux " GOARCH " " SYZ_REVISION " " GIT_REVISION);
+		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);
 		return 0;
 	}
 
-	int pos = 0;
-	for (;;) {
-		int rv = _read(0, input_data + pos, sizeof(input_data) - pos);
-		if (rv < 0)
-			fail("read failed");
-		if (rv == 0)
-			break;
-		pos += rv;
-	}
-	if (pos < 24)
-		fail("truncated input");
+	if (VirtualAlloc((void*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE,
+			 MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE) != (void*)SYZ_DATA_OFFSET)
+		fail("mmap of data segment failed");
 
-	uint64_t flags = *(uint64_t*)input_data;
-	flag_debug = flags & (1 << 0);
-	flag_threaded = flags & (1 << 2);
-	flag_collide = flags & (1 << 3);
-	if (!flag_threaded)
-		flag_collide = false;
-	uint64_t executor_pid = *((uint64_t*)input_data + 2);
-	debug("input %d, threaded=%d collide=%d pid=%llu\n",
-	      pos, flag_threaded, flag_collide, executor_pid);
-
-	execute_one(((uint64_t*)input_data) + 3);
+	setup_control_pipes();
+	receive_execute(true);
+	execute_one();
 	return 0;
 }
 
@@ -71,16 +54,31 @@ void cover_reset(thread_t* th)
 {
 }
 
-uint64_t read_cover_size(thread_t* th)
+uint32 read_cover_size(thread_t* th)
 {
 	return 0;
 }
 
-uint32_t* write_output(uint32_t v)
+bool cover_check(uint32 pc)
+{
+	return true;
+}
+
+bool cover_check(uint64 pc)
+{
+	return true;
+}
+
+uint32* write_output(uint32 v)
 {
 	return &output;
 }
 
-void write_completed(uint32_t completed)
+void write_completed(uint32 completed)
 {
+}
+
+bool kcov_comparison_t::ignore() const
+{
+	return false;
 }

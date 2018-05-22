@@ -22,7 +22,7 @@ xattr_name [
 ] [varlen]
 
 xattr_name_random {
-	prefix	string[xattr_prefix]
+	prefix	stringnoz[xattr_prefix]
 	name	string
 } [packed]
 
@@ -30,4 +30,4 @@ setxattr_flags = XATTR_CREATE, XATTR_REPLACE
 
 xattr_prefix = "system.", "trusted.", "security.", "user.", "btrfs.", "osx.", "os2."
 
-xattr_names = "system.posix_acl_access", "system.posix_acl_default", "system.advise", "system.sockprotoname", "com.apple.FinderInfo", "com.apple.system.Security"
+xattr_names = "system.posix_acl_access", "system.posix_acl_default", "system.advise", "system.sockprotoname", "com.apple.FinderInfo", "com.apple.system.Security", "user.syz", "trusted.syz", "security.evm", "security.ima", "security.selinux", "security.capability"

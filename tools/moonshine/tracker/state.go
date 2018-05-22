@@ -1,7 +1,6 @@
 package tracker
 
 import (
-	"fmt"
 	. "github.com/google/syzkaller/prog"
 )
 
@@ -35,39 +34,41 @@ func NewState(target *Target) *State {
 	return s
 }
 
+
 func (s *State) Analyze(c *Call) {
-	ForeachArgArray(&c.Args, c.Ret, func(arg, base Arg, _ *[]Arg) {
+	ForeachArg(c, func(arg Arg, _ *ArgCtx) {
 		switch typ := arg.Type().(type) {
 		case *ResourceType:
+			a := arg.(*ResultArg)
 			if typ.Dir() != DirIn {
-				s.Resources[typ.Desc.Name] = append(s.Resources[typ.Desc.Name], arg)
+				s.Resources[typ.Desc.Name] = append(s.Resources[typ.Desc.Name], a)
 				// TODO: negative PIDs and add them as well (that's process groups).
 			}
 		case *BufferType:
 			a := arg.(*DataArg)
-			if typ.Dir() != DirOut && len(a.Data) != 0 {
+			if typ.Dir() != DirOut && len(a.Data()) != 0 {
+				val := string(a.Data())
+				// Remove trailing zero padding.
+				for len(val) >= 2 && val[len(val)-1] == 0 && val[len(val)-2] == 0 {
+					val = val[:len(val)-1]
+				}
 				switch typ.Kind {
 				case BufferString:
-					if len(typ.Values) > 0 {
-						s.Strings[string(typ.Values[0])] = c
-					}
+					s.Strings[val] = c
 				case BufferFilename:
-					if _, ok := s.Files[string(a.Data)]; !ok {
-						s.Files[string(a.Data)] = make([]*Call, 0)
+					if len(val) < 3 {
+						// This is not our file, probalby one of specialFiles.
+						return
 					}
-					s.Files[string(a.Data)] = append(s.Files[string(a.Data)], c)
+					if val[len(val)-1] == 0 {
+						val = val[:len(val)-1]
+					}
+					if s.Files[val] == nil {
+						s.Files[val] = make([]*Call, 0)
+					}
+					s.Files[val] = append(s.Files[val], c)
 				}
 			}
 		}
 	})
-	start, npages, mapped := s.Target.AnalyzeMmap(c)
-	if npages != 0 {
-		if start+npages > uint64(len(s.Pages)) {
-			panic(fmt.Sprintf("address is out of bounds: page=%v len=%v bound=%v",
-				start, npages, len(s.Pages)))
-		}
-		for i := uint64(0); i < npages; i++ {
-			s.Pages[start+i] = mapped
-		}
-	}
 }

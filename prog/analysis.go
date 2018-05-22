@@ -12,27 +12,25 @@ import (
 	"fmt"
 )
 
-const (
-	maxPages = 4 << 10
-)
-
 type state struct {
 	target    *Target
 	ct        *ChoiceTable
 	files     map[string]bool
-	resources map[string][]Arg
+	resources map[string][]*ResultArg
 	strings   map[string]bool
-	pages     [maxPages]bool
+	ma        *memAlloc
+	va        *vmaAlloc
 }
 
 // analyze analyzes the program p up to but not including call c.
 func analyze(ct *ChoiceTable, p *Prog, c *Call) *state {
 	s := newState(p.Target, ct)
+	resources := true
 	for _, c1 := range p.Calls {
 		if c1 == c {
-			break
+			resources = false
 		}
-		s.analyze(c1)
+		s.analyzeImpl(c1, resources)
 	}
 	return s
 }
@@ -42,147 +40,134 @@ func newState(target *Target, ct *ChoiceTable) *state {
 		target:    target,
 		ct:        ct,
 		files:     make(map[string]bool),
-		resources: make(map[string][]Arg),
+		resources: make(map[string][]*ResultArg),
 		strings:   make(map[string]bool),
+		ma:        newMemAlloc(target.NumPages * target.PageSize),
+		va:        newVmaAlloc(target.NumPages),
 	}
 	return s
 }
 
 func (s *state) analyze(c *Call) {
-	foreachArgArray(&c.Args, c.Ret, func(arg, base Arg, _ *[]Arg) {
+	s.analyzeImpl(c, true)
+}
+
+func (s *state) analyzeImpl(c *Call, resources bool) {
+	ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+		switch a := arg.(type) {
+		case *PointerArg:
+			switch {
+			case a.IsNull():
+			case a.VmaSize != 0:
+				s.va.noteAlloc(a.Address/s.target.PageSize, a.VmaSize/s.target.PageSize)
+			default:
+				s.ma.noteAlloc(a.Address, a.Res.Size())
+			}
+		}
 		switch typ := arg.Type().(type) {
 		case *ResourceType:
-			if typ.Dir() != DirIn {
-				s.resources[typ.Desc.Name] = append(s.resources[typ.Desc.Name], arg)
+			a := arg.(*ResultArg)
+			if resources && typ.Dir() != DirIn {
+				s.resources[typ.Desc.Name] = append(s.resources[typ.Desc.Name], a)
 				// TODO: negative PIDs and add them as well (that's process groups).
 			}
 		case *BufferType:
 			a := arg.(*DataArg)
-			if typ.Dir() != DirOut && len(a.Data) != 0 {
+			if typ.Dir() != DirOut && len(a.Data()) != 0 {
+				val := string(a.Data())
+				// Remove trailing zero padding.
+				for len(val) >= 2 && val[len(val)-1] == 0 && val[len(val)-2] == 0 {
+					val = val[:len(val)-1]
+				}
 				switch typ.Kind {
 				case BufferString:
-					s.strings[string(a.Data)] = true
+					s.strings[val] = true
 				case BufferFilename:
-					s.files[string(a.Data)] = true
+					if len(val) < 3 {
+						// This is not our file, probalby one of specialFiles.
+						return
+					}
+					if val[len(val)-1] == 0 {
+						val = val[:len(val)-1]
+					}
+					s.files[val] = true
 				}
 			}
 		}
 	})
-	start, npages, mapped := s.target.AnalyzeMmap(c)
-	if npages != 0 {
-		if start+npages > uint64(len(s.pages)) {
-			panic(fmt.Sprintf("address is out of bounds: page=%v len=%v bound=%v",
-				start, npages, len(s.pages)))
+}
+
+type ArgCtx struct {
+	Parent *[]Arg      // GroupArg.Inner (for structs) or Call.Args containing this arg
+	Base   *PointerArg // pointer to the base of the heap object containing this arg
+	Offset uint64      // offset of this arg from the base
+	Stop   bool        // if set by the callback, subargs of this arg are not visited
+}
+
+func ForeachSubArg(arg Arg, f func(Arg, *ArgCtx)) {
+	foreachArgImpl(arg, ArgCtx{}, f)
+}
+
+func ForeachArg(c *Call, f func(Arg, *ArgCtx)) {
+	ctx := ArgCtx{}
+	if c.Ret != nil {
+		foreachArgImpl(c.Ret, ctx, f)
+	}
+	ctx.Parent = &c.Args
+	for _, arg := range c.Args {
+		foreachArgImpl(arg, ctx, f)
+	}
+}
+
+
+func foreachArgImpl(arg Arg, ctx ArgCtx, f func(Arg, *ArgCtx)) {
+	f(arg, &ctx)
+	if ctx.Stop {
+		return
+	}
+	switch a := arg.(type) {
+	case *GroupArg:
+		if _, ok := a.Type().(*StructType); ok {
+			ctx.Parent = &a.Inner
 		}
-		for i := uint64(0); i < npages; i++ {
-			s.pages[start+i] = mapped
+		var totalSize uint64
+		for _, arg1 := range a.Inner {
+			foreachArgImpl(arg1, ctx, f)
+			if !arg1.Type().BitfieldMiddle() {
+				size := arg1.Size()
+				ctx.Offset += size
+				totalSize += size
+			}
 		}
-	}
-}
-
-func foreachSubargImpl(arg Arg, parent *[]Arg, f func(arg, base Arg, parent *[]Arg)) {
-	var rec func(arg, base Arg, parent *[]Arg)
-	rec = func(arg, base Arg, parent *[]Arg) {
-		f(arg, base, parent)
-		switch a := arg.(type) {
-		case *GroupArg:
-			for _, arg1 := range a.Inner {
-				parent1 := parent
-				if _, ok := arg.Type().(*StructType); ok {
-					parent1 = &a.Inner
-				}
-				rec(arg1, base, parent1)
-			}
-		case *PointerArg:
-			if a.Res != nil {
-				rec(a.Res, arg, parent)
-			}
-		case *UnionArg:
-			rec(a.Option, base, parent)
-
+		claimedSize := a.Size()
+		varlen := a.Type().Varlen()
+		if varlen && totalSize > claimedSize || !varlen && totalSize != claimedSize {
+			panic(fmt.Sprintf("bad group arg size %v, should be <= %v for %#v type %#v",
+				totalSize, claimedSize, a, a.Type()))
 		}
-	}
-	rec(arg, nil, parent)
-}
-
-func foreachSubarg(arg Arg, f func(arg, base Arg, parent *[]Arg)) {
-	foreachSubargImpl(arg, nil, f)
-}
-
-func ForeachArgArray(args *[]Arg, ret Arg, f func(arg, base Arg, parent *[]Arg)) {
-	foreachArgArray(args, ret, f);
-}
-
-
-func foreachArgArray(args *[]Arg, ret Arg, f func(arg, base Arg, parent *[]Arg)) {
-
-	for _, arg := range *args {
-		foreachSubargImpl(arg, args, f)
-	}
-	if ret != nil {
-		foreachSubargImpl(ret, nil, f)
-	}
-}
-
-
-func foreachArg(c *Call, f func(arg, base Arg, parent *[]Arg)) {
-	foreachArgArray(&c.Args, nil, f)
-}
-
-func foreachSubargOffset(arg Arg, f func(arg Arg, offset uint64)) {
-	var rec func(Arg, uint64) uint64
-	rec = func(arg1 Arg, offset uint64) uint64 {
-		switch a := arg1.(type) {
-		case *GroupArg:
-			f(arg1, offset)
-			var totalSize uint64
-			for _, arg2 := range a.Inner {
-				size := rec(arg2, offset)
-				if !arg2.Type().BitfieldMiddle() {
-					offset += size
-					totalSize += size
-				}
-			}
-			if totalSize > arg1.Size() {
-				panic(fmt.Sprintf("bad group arg size %v, should be <= %v for %+v", totalSize, arg1.Size(), arg1))
-			}
-		case *UnionArg:
-			f(arg1, offset)
-			size := rec(a.Option, offset)
-			offset += size
-			if size > arg1.Size() {
-				panic(fmt.Sprintf("bad union arg size %v, should be <= %v for arg %+v with type %+v", size, arg1.Size(), arg1, arg1.Type()))
-			}
-		default:
-			f(arg1, offset)
+	case *PointerArg:
+		if a.Res != nil {
+			ctx.Base = a
+			ctx.Offset = 0
+			foreachArgImpl(a.Res, ctx, f)
 		}
-		return arg1.Size()
+	case *UnionArg:
+		foreachArgImpl(a.Option, ctx, f)
 	}
-	rec(arg, 0)
 }
 
-func RequiresBitmasks(p *Prog) bool {
-	result := false
+func RequiredFeatures(p *Prog) (bitmasks, csums bool) {
 	for _, c := range p.Calls {
-		foreachArg(c, func(arg, _ Arg, _ *[]Arg) {
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
 			if a, ok := arg.(*ConstArg); ok {
 				if a.Type().BitfieldOffset() != 0 || a.Type().BitfieldLength() != 0 {
-					result = true
+					bitmasks = true
 				}
 			}
-		})
-	}
-	return result
-}
-
-func RequiresChecksums(p *Prog) bool {
-	result := false
-	for _, c := range p.Calls {
-		foreachArg(c, func(arg, _ Arg, _ *[]Arg) {
 			if _, ok := arg.Type().(*CsumType); ok {
-				result = true
+				csums = true
 			}
 		})
 	}
-	return result
+	return
 }

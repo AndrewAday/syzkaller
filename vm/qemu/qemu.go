@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/vm/vmimpl"
 )
@@ -30,14 +30,15 @@ func init() {
 }
 
 type Config struct {
-	Count     int    // number of VMs to use
-	Qemu      string // qemu binary name (qemu-system-arch by default)
-	Qemu_Args string // additional command line arguments for qemu binary
-	Kernel    string // kernel for injected boot (e.g. arch/x86/boot/bzImage)
-	Cmdline   string // kernel command line (can only be specified with kernel)
-	Initrd    string // linux initial ramdisk. (optional)
-	Cpu       int    // number of VM CPUs
-	Mem       int    // amount of VM memory in MBs
+	Count       int    `json:"count"`        // number of VMs to use
+	Qemu        string `json:"qemu"`         // qemu binary name (qemu-system-arch by default)
+	QemuArgs    string `json:"qemu_args"`    // additional command line arguments for qemu binary
+	Kernel      string `json:"kernel"`       // kernel for injected boot (e.g. arch/x86/boot/bzImage)
+	Cmdline     string `json:"cmdline"`      // kernel command line (can only be specified with kernel)
+	Initrd      string `json:"initrd"`       // linux initial ramdisk. (optional)
+	ImageDevice string `json:"image_device"` // qemu image device (hda by default)
+	CPU         int    `json:"cpu"`          // number of VM CPUs
+	Mem         int    `json:"mem"`          // amount of VM memory in MBs
 }
 
 type Pool struct {
@@ -68,7 +69,7 @@ type archConfig struct {
 var archConfigs = map[string]archConfig{
 	"linux/amd64": {
 		Qemu:     "qemu-system-x86_64",
-		QemuArgs: "-enable-kvm -usb -usbdevice mouse -usbdevice tablet -soundhw all",
+		QemuArgs: "-enable-kvm",
 	},
 	"linux/386": {
 		Qemu: "qemu-system-i386",
@@ -85,7 +86,11 @@ var archConfigs = map[string]archConfig{
 	},
 	"freebsd/amd64": {
 		Qemu:     "qemu-system-x86_64",
-		QemuArgs: "-enable-kvm -usb -usbdevice mouse -usbdevice tablet -soundhw all",
+		QemuArgs: "-enable-kvm",
+	},
+	"netbsd/amd64": {
+		Qemu:     "qemu-system-x86_64",
+		QemuArgs: "-enable-kvm",
 	},
 	"fuchsia/amd64": {
 		Qemu:     "qemu-system-x86_64",
@@ -96,9 +101,10 @@ var archConfigs = map[string]archConfig{
 func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	archConfig := archConfigs[env.OS+"/"+env.Arch]
 	cfg := &Config{
-		Count:     1,
-		Qemu:      archConfig.Qemu,
-		Qemu_Args: archConfig.QemuArgs,
+		Count:       1,
+		ImageDevice: "hda",
+		Qemu:        archConfig.Qemu,
+		QemuArgs:    archConfig.QemuArgs,
 	}
 	if err := config.LoadData(env.Config, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse qemu vm config: %v", err)
@@ -123,12 +129,9 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 		if !osutil.IsExist(env.Image) {
 			return nil, fmt.Errorf("image file '%v' does not exist", env.Image)
 		}
-		if !osutil.IsExist(env.SshKey) {
-			return nil, fmt.Errorf("ssh key '%v' does not exist", env.SshKey)
-		}
 	}
-	if cfg.Cpu <= 0 || cfg.Cpu > 1024 {
-		return nil, fmt.Errorf("bad qemu cpu: %v, want [1-1024]", cfg.Cpu)
+	if cfg.CPU <= 0 || cfg.CPU > 1024 {
+		return nil, fmt.Errorf("bad qemu cpu: %v, want [1-1024]", cfg.CPU)
 	}
 	if cfg.Mem < 128 || cfg.Mem > 1048576 {
 		return nil, fmt.Errorf("bad qemu mem: %v, want [128-1048576]", cfg.Mem)
@@ -147,14 +150,14 @@ func (pool *Pool) Count() int {
 }
 
 func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
-	sshkey := pool.env.SshKey
-	sshuser := pool.env.SshUser
+	sshkey := pool.env.SSHKey
+	sshuser := pool.env.SSHUser
 	if pool.env.Image == "9p" {
 		sshkey = filepath.Join(workdir, "key")
 		sshuser = "root"
-		keygen := exec.Command("ssh-keygen", "-t", "rsa", "-b", "2048", "-N", "", "-C", "", "-f", sshkey)
-		if out, err := keygen.CombinedOutput(); err != nil {
-			return nil, fmt.Errorf("failed to execute ssh-keygen: %v\n%s", err, out)
+		if _, err := osutil.RunCmd(10*time.Minute, "", "ssh-keygen", "-t", "rsa", "-b", "2048",
+			"-N", "", "-C", "", "-f", sshkey); err != nil {
+			return nil, err
 		}
 		initFile := filepath.Join(workdir, "init.sh")
 		if err := osutil.WriteExecFile(initFile, []byte(strings.Replace(initScript, "{{KEY}}", sshkey, -1))); err != nil {
@@ -167,7 +170,8 @@ func (pool *Pool) Create(workdir string, index int) (vmimpl.Instance, error) {
 		if err == nil {
 			return inst, nil
 		}
-		if i < 1000 && strings.Contains(err.Error(), "could not set up host forwarding rule") {
+		// Older qemu prints "could", newer -- "Could".
+		if i < 1000 && strings.Contains(err.Error(), "ould not set up host forwarding rule") {
 			continue
 		}
 		return nil, err
@@ -231,18 +235,16 @@ func (inst *instance) Boot() error {
 			break
 		}
 	}
-	// TODO: ignores inst.cfg.Cpu
 	args := []string{
 		"-m", strconv.Itoa(inst.cfg.Mem),
+		"-smp", strconv.Itoa(inst.cfg.CPU),
 		"-net", "nic",
 		"-net", fmt.Sprintf("user,host=%v,hostfwd=tcp::%v-:22", hostAddr, inst.port),
 		"-display", "none",
 		"-serial", "stdio",
 		"-no-reboot",
-		"-numa", "node,nodeid=0,cpus=0-1", "-numa", "node,nodeid=1,cpus=2-3",
-		"-smp", "sockets=2,cores=2,threads=1",
 	}
-	args = append(args, strings.Split(inst.cfg.Qemu_Args, " ")...)
+	args = append(args, strings.Split(inst.cfg.QemuArgs, " ")...)
 	if inst.image == "9p" {
 		args = append(args,
 			"-fsdev", "local,id=fsdev0,path=/,security_model=none,readonly",
@@ -250,7 +252,7 @@ func (inst *instance) Boot() error {
 		)
 	} else {
 		args = append(args,
-			"-hda", inst.image,
+			"-"+inst.cfg.ImageDevice, inst.image,
 			"-snapshot",
 		)
 	}
@@ -304,9 +306,9 @@ func (inst *instance) Boot() error {
 		)
 	}
 	if inst.debug {
-		Logf(0, "running command: %v %#v", inst.cfg.Qemu, args)
+		log.Logf(0, "running command: %v %#v", inst.cfg.Qemu, args)
 	}
-	qemu := exec.Command(inst.cfg.Qemu, args...)
+	qemu := osutil.Command(inst.cfg.Qemu, args...)
 	qemu.Stdout = inst.wpipe
 	qemu.Stderr = inst.wpipe
 	if err := qemu.Start(); err != nil {
@@ -368,13 +370,13 @@ func (inst *instance) Boot() error {
 			time.Sleep(time.Second) // wait for any pending output
 			bootOutputStop <- true
 			<-bootOutputStop
-			return fmt.Errorf("qemu stopped:\n%v\n", string(bootOutput))
+			return vmimpl.BootError{Title: "qemu stopped", Output: bootOutput}
 		default:
 		}
 		if time.Since(start) > 10*time.Minute {
 			bootOutputStop <- true
 			<-bootOutputStop
-			return fmt.Errorf("ssh server did not start:\n%v\n", string(bootOutput))
+			return vmimpl.BootError{Title: "ssh server did not start", Output: bootOutput}
 		}
 	}
 	bootOutputStop <- true
@@ -392,9 +394,9 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	}
 	vmDst := filepath.Join(basePath, filepath.Base(hostSrc))
 	args := append(inst.sshArgs("-P"), hostSrc, inst.sshuser+"@localhost:"+vmDst)
-	cmd := exec.Command("scp", args...)
+	cmd := osutil.Command("scp", args...)
 	if inst.debug {
-		Logf(0, "running command: scp %#v", args)
+		log.Logf(0, "running command: scp %#v", args)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stdout
 	}
@@ -417,7 +419,8 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (<-chan []byte, <-chan error, error) {
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+	<-chan []byte, <-chan error, error) {
 	rpipe, wpipe, err := osutil.LongPipe()
 	if err != nil {
 		return nil, nil, err
@@ -427,9 +430,10 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 
 	args := append(inst.sshArgs("-p"), inst.sshuser+"@localhost", command)
 	if inst.debug {
-		Logf(0, "running command: ssh %#v", args)
+		log.Logf(0, "running command: ssh %#v", args)
 	}
-	cmd := exec.Command("ssh", args...) // build Command struct
+
+	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil { // run command
@@ -448,9 +452,9 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	go func() {
 		select {
 		case <-time.After(timeout):
-			signal(vmimpl.TimeoutErr)
+			signal(vmimpl.ErrTimeout)
 		case <-stop:
-			signal(vmimpl.TimeoutErr)
+			signal(vmimpl.ErrTimeout)
 		case err := <-inst.merger.Err:
 			cmd.Process.Kill()
 			if cmdErr := cmd.Wait(); cmdErr == nil {
@@ -469,7 +473,6 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 
 func (inst *instance) sshArgs(portArg string) []string {
 	args := []string{
-		"-i", inst.sshkey,
 		portArg, strconv.Itoa(inst.port),
 		"-F", "/dev/null",
 		"-o", "ConnectionAttempts=10",
@@ -480,12 +483,16 @@ func (inst *instance) sshArgs(portArg string) []string {
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "LogLevel=error",
 	}
+	if inst.sshkey != "" {
+		args = append(args, "-i", inst.sshkey)
+	}
 	if inst.debug {
 		args = append(args, "-v")
 	}
 	return args
 }
 
+// nolint: lll
 const initScript = `#! /bin/bash
 set -eux
 mount -t proc none /proc

@@ -9,11 +9,10 @@ import (
 	"github.com/google/syzkaller/prog"
 )
 
-// DetectSupportedSyscalls returns list on supported syscalls on host.
-func DetectSupportedSyscalls(target *prog.Target) (map[*prog.Syscall]bool, error) {
-	supported := make(map[*prog.Syscall]bool)
-	for _, c := range target.Syscalls {
-		supported[c] = true
-	}
-	return supported, nil
+func isSupported(c *prog.Syscall, sandbox string) (bool, string) {
+	return true, ""
+}
+
+func EnableFaultInjection() error {
+	return nil
 }

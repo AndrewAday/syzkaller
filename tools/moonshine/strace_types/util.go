@@ -740,8 +740,13 @@ func GroupArg(t prog.Type, inner []prog.Arg) prog.Arg {
 	return &prog.GroupArg{ArgCommon: commonArg(t), Inner: inner}
 }
 
-func PointerArg(t prog.Type, page uint64, off int, npages uint64, obj prog.Arg) prog.Arg {
-	return &prog.PointerArg{ArgCommon: commonArg(t), PageIndex: page, PageOffset: off, PagesNum: npages, Res: obj}
+func PointerArg(t prog.Type, address uint64, vmaSize uint64, res prog.Arg) prog.Arg {
+	return &prog.PointerArg{
+		ArgCommon: commonArg(t),
+		Address: address,
+		VmaSize: vmaSize,
+		Res: res,
+	}
 }
 
 func ConstArg(t prog.Type, v uint64) prog.Arg {
@@ -749,32 +754,19 @@ func ConstArg(t prog.Type, v uint64) prog.Arg {
 }
 
 func DataArg(t prog.Type, data []byte) prog.Arg {
-	return &prog.DataArg{ArgCommon: commonArg(t), Data: append([]byte{}, data...)}
+	return prog.MakeDataArg(t, data)
 }
 
-func UnionArg(t prog.Type, opt prog.Arg, typ prog.Type) prog.Arg {
-	return &prog.UnionArg{ArgCommon: commonArg(t), Option: opt, OptionType: typ}
+func UnionArg(t prog.Type, opt prog.Arg) prog.Arg {
+	return prog.MakeUnionArg(t, opt)
 }
 
-func ResultArg(t prog.Type, r prog.Arg, v uint64) prog.Arg {
-	arg := &prog.ResultArg{ArgCommon: commonArg(t), Res: r, Val: v}
-	if r == nil {
-		return arg
-	}
-	if used, ok := r.(prog.ArgUsed); ok {
-		if *used.Used() == nil {
-			*used.Used() = make(map[prog.Arg]bool)
-		}
-		if (*used.Used())[arg] {
-			panic("already used")
-		}
-		(*used.Used())[arg] = true
-	}
-	return arg
+func ResultArg(t prog.Type, r *prog.ResultArg, v uint64) prog.Arg {
+	return prog.MakeResultArg(t, r, v)
 }
 
-func ReturnArg(t prog.Type) prog.Arg {
-	return &prog.ReturnArg{ArgCommon: commonArg(t)}
+func ReturnArg(t prog.Type) *prog.ResultArg {
+	return prog.MakeReturnArg(t)
 }
 
 func GetSyzType(typ prog.Type) string {

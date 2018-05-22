@@ -7,6 +7,8 @@ import (
 	"bufio"
 	"bytes"
 	"io/ioutil"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -41,7 +43,7 @@ func NewErrorMatcher(t *testing.T, file string) *ErrorMatcher {
 				break
 			}
 			errors = append(errors, &errorDesc{
-				file: file,
+				file: filepath.Base(file),
 				line: i,
 				text: strings.TrimSpace(string(ln[pos+3:])),
 			})
@@ -59,7 +61,12 @@ func NewErrorMatcher(t *testing.T, file string) *ErrorMatcher {
 	}
 }
 
+var errorLocationRe = regexp.MustCompile(`at [a-z][a-z0-9]+\.txt:[0-9]+:[0-9]+`)
+
 func (em *ErrorMatcher) ErrorHandler(pos Pos, msg string) {
+	if match := errorLocationRe.FindStringSubmatchIndex(msg); match != nil {
+		msg = msg[0:match[0]] + "at LOCATION" + msg[match[1]:]
+	}
 	em.got = append(em.got, &errorDesc{
 		file: pos.File,
 		line: pos.Line,
@@ -82,13 +89,13 @@ nextErr:
 			want.matched = true
 			continue nextErr
 		}
-		t.Errorf("unexpected error: %v:%v:%v: %v", e.file, e.line, e.col, e.text)
+		t.Errorf("unexpected error:\n%v:%v:%v: %v", e.file, e.line, e.col, e.text)
 	}
 	for _, want := range em.expect {
 		if want.matched {
 			continue
 		}
-		t.Errorf("unmatched error: %v:%v: %v", want.file, want.line, want.text)
+		t.Errorf("unmatched error:\n%v:%v: %v", want.file, want.line, want.text)
 	}
 }
 

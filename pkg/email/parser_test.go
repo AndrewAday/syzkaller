@@ -10,11 +10,16 @@ import (
 	"testing"
 )
 
-//!!! add tests with \r\n
 func TestExtractCommand(t *testing.T) {
 	for i, test := range extractCommandTests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			cmd, args := extractCommand([]byte(test.body))
+			if cmd != test.cmd || !reflect.DeepEqual(args, test.args) {
+				t.Logf("expect: %q %q", test.cmd, test.args)
+				t.Logf("got   : %q %q", cmd, args)
+				t.Fail()
+			}
+			cmd, args = extractCommand([]byte(strings.Replace(test.body, "\n", "\r\n", -1)))
 			if cmd != test.cmd || !reflect.DeepEqual(args, test.args) {
 				t.Logf("expect: %q %q", test.cmd, test.args)
 				t.Logf("got   : %q %q", cmd, args)
@@ -76,10 +81,44 @@ func TestAddRemoveAddrContext(t *testing.T) {
 	}
 }
 
+func TestAddAddrContextEmptyName(t *testing.T) {
+	email := "<foo@bar.com>"
+	email1, err := AddAddrContext(email, "context")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "foo+context@bar.com"; want != email1 {
+		t.Fatalf("want: %q, got %q", want, email1)
+	}
+	email2, context1, err := RemoveAddrContext(email1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if email != email2 {
+		t.Fatalf("want: %q, got %q", email, email2)
+	}
+	if context1 != "context" {
+		t.Fatalf("got context %q", context1)
+	}
+}
+
+func TestCanonicalEmail(t *testing.T) {
+	canonical := "foo@bar.com"
+	emails := []string{
+		"\"Foo Bar\" <foo+123+456@Bar.com>",
+		"<Foo@bar.com>",
+	}
+	for _, email := range emails {
+		if got := CanonicalEmail(email); got != canonical {
+			t.Errorf("got %q, want %q", got, canonical)
+		}
+	}
+}
+
 func TestParse(t *testing.T) {
 	for i, test := range parseTests {
 		body := func(t *testing.T, test ParseTest) {
-			email, err := Parse(strings.NewReader(test.email), "bot <foo@bar.com>")
+			email, err := Parse(strings.NewReader(test.email), []string{"bot <foo@bar.com>"})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -106,28 +145,111 @@ var extractCommandTests = []struct {
 		body: `Hello,
 
 line1
-#syz  foo  bar baz 	`,
-		cmd:  "foo",
+#syz  fix:  bar baz 	`,
+		cmd:  "fix:",
 		args: "bar baz",
 	},
 	{
 		body: `Hello,
 
 line1
-#syz foo bar  	 baz
+#syz fix:  bar  	 baz
 line 2
 `,
-		cmd: "foo",
+		cmd: "fix:",
 		args: "bar  	 baz",
 	},
 	{
 		body: `
 line1
-> #syz foo bar   baz
+> #syz fix: bar   baz
 line 2
 `,
 		cmd:  "",
 		args: "",
+	},
+	// This is unfortunate case when a command is split by email client
+	// due to 80-column limitation.
+	{
+		body: `
+#syz test: git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+locking/core
+`,
+		cmd:  "test:",
+		args: "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core",
+	},
+	{
+		body: `
+#syz test:
+git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core
+`,
+		cmd:  "test:",
+		args: "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core",
+	},
+	{
+		body: `
+#syz test:
+git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git
+locking/core
+locking/core
+`,
+		cmd:  "test:",
+		args: "git://git.kernel.org/pub/scm/linux/kernel/git/tip/tip.git locking/core",
+	},
+	{
+		body: `
+#syz test_5_arg_cmd arg1
+
+ arg2  arg3
+ 
+arg4
+arg5
+`,
+		cmd:  "test_5_arg_cmd",
+		args: "arg1 arg2 arg3 arg4 arg5",
+	},
+	{
+		body: `
+#syz test_5_arg_cmd arg1
+arg2`,
+		cmd:  "test_5_arg_cmd",
+		args: "arg1 arg2",
+	},
+	{
+		body: `
+#syz test_5_arg_cmd arg1
+arg2
+`,
+		cmd:  "test_5_arg_cmd",
+		args: "arg1 arg2",
+	},
+	{
+		body: `
+#syz test_5_arg_cmd arg1
+arg2
+
+ 
+`,
+		cmd:  "test_5_arg_cmd",
+		args: "arg1 arg2",
+	},
+	{
+		body: `
+#syz fix:
+arg1 arg2 arg3
+arg4 arg5
+ 
+`,
+		cmd:  "fix:",
+		args: "arg1 arg2 arg3",
+	},
+	{
+		body: `
+#syz  fix: arg1 arg2 arg3
+arg4 arg5 
+`,
+		cmd:  "fix:",
+		args: "arg1 arg2 arg3",
 	},
 }
 
@@ -136,6 +258,7 @@ type ParseTest struct {
 	res   Email
 }
 
+// nolint: lll
 var parseTests = []ParseTest{
 	{`Date: Sun, 7 May 2017 19:54:00 -0700
 Message-ID: <123>
@@ -146,7 +269,7 @@ Content-Type: text/plain; charset="UTF-8"
 
 text body
 second line
-#syz command 	 arg1 arg2 arg3 	
+#syz fix: 	 arg1 arg2 arg3 	
 last line
 -- 
 You received this message because you are subscribed to the Google Groups "syzkaller" group.
@@ -163,7 +286,7 @@ For more options, visit https://groups.google.com/d/optout.`,
 			Cc:        []string{"bob@example.com"},
 			Body: `text body
 second line
-#syz command 	 arg1 arg2 arg3 	
+#syz fix: 	 arg1 arg2 arg3 	
 last line
 -- 
 You received this message because you are subscribed to the Google Groups "syzkaller" group.
@@ -172,7 +295,7 @@ To post to this group, send email to syzkaller@googlegroups.com.
 To view this discussion on the web visit https://groups.google.com/d/msgid/syzkaller/abcdef@google.com.
 For more options, visit https://groups.google.com/d/optout.`,
 			Patch:       "",
-			Command:     "command",
+			Command:     "fix:",
 			CommandArgs: "arg1 arg2 arg3",
 		}},
 
@@ -201,9 +324,8 @@ Message-ID: <123>
 Subject: test subject
 From: Bob <bob@example.com>
 To: syzbot <bot@example.com>, Alice <alice@example.com>
-Content-Type: text/plain
 
-#syz  command   	 
+#syz  invalid   	 
 text body
 second line
 last line`,
@@ -212,12 +334,12 @@ last line`,
 			Subject:   "test subject",
 			From:      "\"Bob\" <bob@example.com>",
 			Cc:        []string{"alice@example.com", "bob@example.com", "bot@example.com"},
-			Body: `#syz  command   	 
+			Body: `#syz  invalid   	 
 text body
 second line
 last line`,
 			Patch:       "",
-			Command:     "command",
+			Command:     "invalid",
 			CommandArgs: "",
 		}},
 
@@ -327,7 +449,7 @@ index 3d85747bd86e..a257b872a53d 100644
   return -EINVAL;
 - if (!filename)
 - return -EINVAL;
-
+ 
   error = vfs_statx(dfd, filename, flags, &stat, mask);
   if (error)
 
@@ -385,7 +507,7 @@ index 3d85747bd86e..a257b872a53d 100644
   return -EINVAL;
 - if (!filename)
 - return -EINVAL;
-
+ 
   error = vfs_statx(dfd, filename, flags, &stat, mask);
   if (error)
 `,
@@ -397,7 +519,7 @@ index 3d85747bd86e..a257b872a53d 100644
   return -EINVAL;
 - if (!filename)
 - return -EINVAL;
-
+ 
   error = vfs_statx(dfd, filename, flags, &stat, mask);
   if (error)
 `,

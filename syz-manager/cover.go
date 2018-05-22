@@ -10,13 +10,16 @@ import (
 	"html/template"
 	"io"
 	"io/ioutil"
-	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/hash"
+	"github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/symbolizer"
 )
 
@@ -57,11 +60,7 @@ var (
 	vmOffsets       = make(map[string]uint32)
 )
 
-const (
-	callLen = 5 // length of a call instruction, x86-ism
-)
-
-func initAllCover(vmlinux string) {
+func initAllCover(os, arch, vmlinux string) {
 	// Running objdump on vmlinux takes 20-30 seconds, so we do it asynchronously on start.
 	// Running nm on vmlinux may takes 200 microsecond and being called during symbolization of every crash,
 	// so also do it asynchronously on start and reuse the value during each crash.
@@ -73,40 +72,42 @@ func initAllCover(vmlinux string) {
 		if vmlinux == "" {
 			return
 		}
-		pcs, err := coveredPCs(vmlinux)
+		pcs, err := coveredPCs(arch, vmlinux)
 		if err == nil {
 			sort.Sort(uint64Array(pcs))
 			allCoverPCs = pcs
 		} else {
-			Logf(0, "failed to run objdump on %v: %v", vmlinux, err)
+			log.Logf(0, "failed to run objdump on %v: %v", vmlinux, err)
 		}
 
 		allSymbols, err = symbolizer.ReadSymbols(vmlinux)
 		if err != nil {
-			Logf(0, "failed to run nm on %v: %v", vmlinux, err)
+			log.Logf(0, "failed to run nm on %v: %v", vmlinux, err)
 		}
 	}()
 }
 
-func generateCoverHtml(w io.Writer, vmlinux string, cov []uint32) error {
+func generateCoverHTML(w io.Writer, vmlinux, arch string, cov cover.Cover) error {
 	if len(cov) == 0 {
 		return fmt.Errorf("No coverage data available")
 	}
 
-	base, err := getVmOffset(vmlinux)
+	base, err := getVMOffset(vmlinux)
 	if err != nil {
 		return err
 	}
-	pcs := make([]uint64, len(cov))
-	for i, pc := range cov {
-		pcs[i] = cover.RestorePC(pc, base) - callLen
+	pcs := make([]uint64, 0, len(cov))
+	for pc := range cov {
+		fullPC := cover.RestorePC(pc, base)
+		prevPC := previousInstructionPC(arch, fullPC)
+		pcs = append(pcs, prevPC)
 	}
 	uncovered, err := uncoveredPcsInFuncs(vmlinux, pcs)
 	if err != nil {
 		return err
 	}
 
-	coveredFrames, prefix, err := symbolize(vmlinux, pcs)
+	coveredFrames, _, err := symbolize(vmlinux, pcs)
 	if err != nil {
 		return err
 	}
@@ -145,10 +146,9 @@ func generateCoverHtml(w io.Writer, vmlinux string, cov []uint32) error {
 				buf.Write([]byte{'\n'})
 			}
 		}
-		if len(f) > len(prefix) {
-			f = f[len(prefix):]
-		}
+		f = filepath.Clean(strings.TrimPrefix(f, prefix))
 		d.Files = append(d.Files, &templateFile{
+			ID:       hash.String([]byte(f)),
 			Name:     f,
 			Body:     template.HTML(buf.String()),
 			Coverage: coverage,
@@ -156,10 +156,7 @@ func generateCoverHtml(w io.Writer, vmlinux string, cov []uint32) error {
 	}
 
 	sort.Sort(templateFileArray(d.Files))
-	if err := coverTemplate.Execute(w, d); err != nil {
-		return err
-	}
-	return nil
+	return coverTemplate.Execute(w, d)
 }
 
 func fileSet(covered, uncovered []symbolizer.Frame) map[string][]coverage {
@@ -216,13 +213,13 @@ func parseFile(fn string) ([][]byte, error) {
 	return lines, nil
 }
 
-func getVmOffset(vmlinux string) (uint32, error) {
+func getVMOffset(vmlinux string) (uint32, error) {
 	if v, ok := vmOffsets[vmlinux]; ok {
 		return v, nil
 	}
-	out, err := exec.Command("readelf", "-SW", vmlinux).CombinedOutput()
+	out, err := osutil.RunCmd(time.Hour, "", "readelf", "-SW", vmlinux)
 	if err != nil {
-		return 0, fmt.Errorf("readelf failed: %v\n%s", err, out)
+		return 0, err
 	}
 	s := bufio.NewScanner(bytes.NewReader(out))
 	var addr uint32
@@ -307,8 +304,8 @@ func uncoveredPcsInFuncs(vmlinux string, pcs []uint64) ([]uint64, error) {
 }
 
 // coveredPCs returns list of PCs of __sanitizer_cov_trace_pc calls in binary bin.
-func coveredPCs(bin string) ([]uint64, error) {
-	cmd := exec.Command("objdump", "-d", "--no-show-raw-insn", bin)
+func coveredPCs(arch, bin string) ([]uint64, error) {
+	cmd := osutil.Command("objdump", "-d", "--no-show-raw-insn", bin)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -320,14 +317,33 @@ func coveredPCs(bin string) ([]uint64, error) {
 	defer cmd.Wait()
 	var pcs []uint64
 	s := bufio.NewScanner(stdout)
-	// A line looks as: "ffffffff8100206a:       callq  ffffffff815cc1d0 <__sanitizer_cov_trace_pc>"
-	callInsn := []byte("callq ")
 	traceFunc := []byte(" <__sanitizer_cov_trace_pc>")
+	var callInsn []byte
+	switch arch {
+	case "amd64":
+		// ffffffff8100206a:       callq  ffffffff815cc1d0 <__sanitizer_cov_trace_pc>
+		callInsn = []byte("\tcallq ")
+	case "386":
+		// c1000102:       call   c10001f0 <__sanitizer_cov_trace_pc>
+		callInsn = []byte("\tcall ")
+	case "arm64":
+		// ffff0000080d9cc0:       bl      ffff00000820f478 <__sanitizer_cov_trace_pc>
+		callInsn = []byte("\tbl\t")
+	case "arm":
+		// 8010252c:       bl      801c3280 <__sanitizer_cov_trace_pc>
+		callInsn = []byte("\tbl\t")
+	case "ppc64le":
+		// c00000000006d904:       bl      c000000000350780 <.__sanitizer_cov_trace_pc>
+		callInsn = []byte("\tbl ")
+		traceFunc = []byte(" <.__sanitizer_cov_trace_pc>")
+	default:
+		panic("unknown arch")
+	}
 	for s.Scan() {
 		ln := s.Bytes()
 		if pos := bytes.Index(ln, callInsn); pos == -1 {
 			continue
-		} else if bytes.Index(ln[pos:], traceFunc) == -1 {
+		} else if !bytes.Contains(ln[pos:], traceFunc) {
 			continue
 		}
 		colon := bytes.IndexByte(ln, ':')
@@ -375,11 +391,31 @@ func symbolize(vmlinux string, pcs []uint64) ([]symbolizer.Frame, string, error)
 	return frames, prefix, nil
 }
 
+func previousInstructionPC(arch string, pc uint64) uint64 {
+	switch arch {
+	case "amd64":
+		return pc - 5
+	case "386":
+		return pc - 1
+	case "arm64":
+		return pc - 4
+	case "arm":
+		// THUMB instructions are 2 or 4 bytes with low bit set.
+		// ARM instructions are always 4 bytes.
+		return (pc - 3) & ^uint64(1)
+	case "ppc64le":
+		return pc - 4
+	default:
+		panic("unknown arch")
+	}
+}
+
 type templateData struct {
 	Files []*templateFile
 }
 
 type templateFile struct {
+	ID       string
 	Name     string
 	Body     template.HTML
 	Coverage int
@@ -404,8 +440,7 @@ func (a templateFileArray) Less(i, j int) bool {
 }
 func (a templateFileArray) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
-var coverTemplate = template.Must(template.New("").Parse(
-	`
+var coverTemplate = template.Must(template.New("").Parse(`
 <!DOCTYPE html>
 <html>
 	<head>
@@ -445,28 +480,40 @@ var coverTemplate = template.Must(template.New("").Parse(
 		<div id="topbar">
 			<div id="nav">
 				<select id="files">
-				{{range $i, $f := .Files}}
-				<option value="file{{$i}}">{{$f.Name}} ({{$f.Coverage}})</option>
+				{{range $f := .Files}}
+				<option value="{{$f.ID}}">{{$f.Name}} ({{$f.Coverage}})</option>
 				{{end}}
 				</select>
 			</div>
 		</div>
 		<div id="content">
 		{{range $i, $f := .Files}}
-		<pre class="file" id="file{{$i}}" {{if $i}}style="display: none"{{end}}>{{$f.Body}}</pre>
-		{{end}}
+		<pre class="file" id="{{$f.ID}}" {{if $i}}style="display: none;"{{end}}>{{$f.Body}}</pre>{{end}}
 		</div>
 	</body>
 	<script>
 	(function() {
 		var files = document.getElementById('files');
-		var visible = document.getElementById('file0');
+		var visible = document.getElementById(files.value);
+		if (window.location.hash) {
+			var hash = window.location.hash.substring(1);
+			for (var i = 0; i < files.options.length; i++) {
+				if (files.options[i].value === hash) {
+					files.selectedIndex = i;
+					visible.style.display = 'none';
+					visible = document.getElementById(files.value);
+					visible.style.display = 'block';
+					break;
+				}
+			}
+		}
 		files.addEventListener('change', onChange, false);
 		function onChange() {
 			visible.style.display = 'none';
 			visible = document.getElementById(files.value);
 			visible.style.display = 'block';
 			window.scrollTo(0, 0);
+			window.location.hash = files.value;
 		}
 	})();
 	</script>

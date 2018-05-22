@@ -32,9 +32,10 @@ type Email struct {
 
 const commandPrefix = "#syz "
 
-var groupsLinkRe = regexp.MustCompile("\nTo view this discussion on the web visit (https://groups\\.google\\.com/.*?)\\.(?:\r)?\n")
+var groupsLinkRe = regexp.MustCompile("\nTo view this discussion on the web visit" +
+	" (https://groups\\.google\\.com/.*?)\\.(?:\r)?\n")
 
-func Parse(r io.Reader, ownEmail string) (*Email, error) {
+func Parse(r io.Reader, ownEmails []string) (*Email, error) {
 	msg, err := mail.ReadMessage(r)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read email: %v", err)
@@ -46,21 +47,23 @@ func Parse(r io.Reader, ownEmail string) (*Email, error) {
 	if len(from) == 0 {
 		return nil, fmt.Errorf("failed to parse email header 'To': no senders")
 	}
-	to, err := msg.Header.AddressList("To")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse email header 'To': %v", err)
-	}
+	// Ignore errors since To: header may not be present (we've seen such case).
+	to, _ := msg.Header.AddressList("To")
 	// AddressList fails if the header is not present.
 	cc, _ := msg.Header.AddressList("Cc")
 	bugID := ""
 	var ccList []string
-	if addr, err := mail.ParseAddress(ownEmail); err == nil {
-		ownEmail = addr.Address
+	ownAddrs := make(map[string]bool)
+	for _, email := range ownEmails {
+		ownAddrs[email] = true
+		if addr, err := mail.ParseAddress(email); err == nil {
+			ownAddrs[addr.Address] = true
+		}
 	}
 	fromMe := false
 	for _, addr := range from {
 		cleaned, _, _ := RemoveAddrContext(addr.Address)
-		if addr, err := mail.ParseAddress(cleaned); err == nil && addr.Address == ownEmail {
+		if addr, err := mail.ParseAddress(cleaned); err == nil && ownAddrs[addr.Address] {
 			fromMe = true
 		}
 	}
@@ -69,7 +72,7 @@ func Parse(r io.Reader, ownEmail string) (*Email, error) {
 		if addr, err := mail.ParseAddress(cleaned); err == nil {
 			cleaned = addr.Address
 		}
-		if cleaned == ownEmail {
+		if ownAddrs[cleaned] {
 			if bugID == "" {
 				bugID = context
 			}
@@ -126,8 +129,12 @@ func AddAddrContext(email, context string) (string, error) {
 	if at == -1 {
 		return "", fmt.Errorf("failed to parse %q as email: no @", email)
 	}
-	addr.Address = addr.Address[:at] + "+" + context + addr.Address[at:]
-	return addr.String(), nil
+	result := addr.Address[:at] + "+" + context + addr.Address[at:]
+	if addr.Name != "" {
+		addr.Address = result
+		result = addr.String()
+	}
+	return result, nil
 }
 
 // RemoveAddrContext extracts context after '+' from the local part of the provided email address.
@@ -150,6 +157,21 @@ func RemoveAddrContext(email string) (string, string, error) {
 	return addr.String(), context, nil
 }
 
+func CanonicalEmail(email string) string {
+	addr, err := mail.ParseAddress(email)
+	if err != nil {
+		return email
+	}
+	at := strings.IndexByte(addr.Address, '@')
+	if at == -1 {
+		return email
+	}
+	if plus := strings.IndexByte(addr.Address[:at], '+'); plus != -1 {
+		addr.Address = addr.Address[:plus] + addr.Address[at:]
+	}
+	return strings.ToLower(addr.Address)
+}
+
 // extractCommand extracts command to syzbot from email body.
 // Commands are of the following form:
 // ^#syz cmd args...
@@ -159,33 +181,87 @@ func extractCommand(body []byte) (cmd, args string) {
 		return
 	}
 	cmdPos += len(commandPrefix)
+	for cmdPos < len(body) && body[cmdPos] == ' ' {
+		cmdPos++
+	}
 	cmdEnd := bytes.IndexByte(body[cmdPos:], '\n')
 	if cmdEnd == -1 {
 		cmdEnd = len(body) - cmdPos
 	}
-	cmdLine := strings.TrimSpace(string(body[cmdPos : cmdPos+cmdEnd]))
-	if cmdLine == "" {
-		return
+	if cmdEnd1 := bytes.IndexByte(body[cmdPos:], '\r'); cmdEnd1 != -1 && cmdEnd1 < cmdEnd {
+		cmdEnd = cmdEnd1
 	}
-	split := strings.Split(cmdLine, " ")
-	cmd = split[0]
-	if len(split) > 1 {
-		args = strings.TrimSpace(strings.Join(split[1:], " "))
+	if cmdEnd1 := bytes.IndexByte(body[cmdPos:], ' '); cmdEnd1 != -1 && cmdEnd1 < cmdEnd {
+		cmdEnd = cmdEnd1
+	}
+	cmd = string(body[cmdPos : cmdPos+cmdEnd])
+	// Some email clients split text emails at 80 columns are the transformation is irrevesible.
+	// We try hard to restore what was there before.
+	// For "test:" command we know that there must be 2 tokens without spaces.
+	// For "fix:"/"dup:" we need a whole non-empty line of text.
+	switch cmd {
+	case "test:":
+		args = extractArgsTokens(body[cmdPos+cmdEnd:], 2)
+	case "test_5_arg_cmd":
+		args = extractArgsTokens(body[cmdPos+cmdEnd:], 5)
+	case "fix:", "dup:":
+		args = extractArgsLine(body[cmdPos+cmdEnd:])
 	}
 	return
 }
 
+func extractArgsTokens(body []byte, num int) string {
+	var args []string
+	for pos := 0; len(args) < num && pos < len(body); {
+		lineEnd := bytes.IndexByte(body[pos:], '\n')
+		if lineEnd == -1 {
+			lineEnd = len(body) - pos
+		}
+		line := strings.TrimSpace(string(body[pos : pos+lineEnd]))
+		for {
+			line1 := strings.Replace(line, "  ", " ", -1)
+			if line == line1 {
+				break
+			}
+			line = line1
+		}
+		if line != "" {
+			args = append(args, strings.Split(line, " ")...)
+		}
+		pos += lineEnd + 1
+	}
+	return strings.TrimSpace(strings.Join(args, " "))
+}
+
+func extractArgsLine(body []byte) string {
+	pos := 0
+	for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t' ||
+		body[pos] == '\n' || body[pos] == '\r') {
+		pos++
+	}
+	lineEnd := bytes.IndexByte(body[pos:], '\n')
+	if lineEnd == -1 {
+		lineEnd = len(body) - pos
+	}
+	return strings.TrimSpace(string(body[pos : pos+lineEnd]))
+}
+
 func parseBody(r io.Reader, headers mail.Header) (body []byte, attachments [][]byte, err error) {
-	mediaType, params, err := mime.ParseMediaType(headers.Get("Content-Type"))
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse email header 'Content-Type': %v", err)
+	// git-send-email sends emails without Content-Type, let's assume it's text.
+	mediaType := "text/plain"
+	var params map[string]string
+	if contentType := headers.Get("Content-Type"); contentType != "" {
+		mediaType, params, err = mime.ParseMediaType(headers.Get("Content-Type"))
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to parse email header 'Content-Type': %v", err)
+		}
+	}
+	// Note: mime package handles quoted-printable internally.
+	if strings.ToLower(headers.Get("Content-Transfer-Encoding")) == "base64" {
+		r = base64.NewDecoder(base64.StdEncoding, r)
 	}
 	disp, _, _ := mime.ParseMediaType(headers.Get("Content-Disposition"))
 	if disp == "attachment" {
-		// Note: mime package handles quoted-printable internally.
-		if strings.ToLower(headers.Get("Content-Transfer-Encoding")) == "base64" {
-			r = base64.NewDecoder(base64.StdEncoding, r)
-		}
 		attachment, err := ioutil.ReadAll(r)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to read email body: %v", err)

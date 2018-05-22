@@ -18,21 +18,19 @@ func TestAssignSizeRandom(t *testing.T) {
 			target.assignSizesCall(call)
 		}
 		if data1 := p.Serialize(); !bytes.Equal(data0, data1) {
-			t.Fatalf("different lens assigned, initial: %v, new: %v", data0, data1)
+			t.Fatalf("different lens assigned, initial:\n%s\nnew:\n%s\n", data0, data1)
 		}
 		p.Mutate(rs, 10, nil, nil)
-		data0 = p.Serialize()
+		p.Serialize()
 		for _, call := range p.Calls {
 			target.assignSizesCall(call)
-		}
-		if data1 := p.Serialize(); !bytes.Equal(data0, data1) {
-			t.Fatalf("different lens assigned, initial: %v, new: %v", data0, data1)
 		}
 	}
 }
 
 func TestAssignSize(t *testing.T) {
-	target, _, _ := initTest(t)
+	target := initTargetTest(t, "test", "64")
+	// nolint: lll
 	tests := []struct {
 		unsizedProg string
 		sizedProg   string
@@ -78,8 +76,8 @@ func TestAssignSize(t *testing.T) {
 			"syz_test$length9(&(0x7f000001f000)={&(0x7f0000000000/0x5000)=nil, 0x5000})",
 		},
 		{
-			"syz_test$length10(&(0x7f0000000000/0x5000)=nil, 0x0000)",
-			"syz_test$length10(&(0x7f0000000000/0x5000)=nil, 0x5000)",
+			"syz_test$length10(&(0x7f0000000000/0x5000)=nil, 0x0000, 0x0000, 0x0000, 0x0000)",
+			"syz_test$length10(&(0x7f0000000000/0x5000)=nil, 0x5000, 0x5000, 0x2800, 0x1400)",
 		},
 		{
 			"syz_test$length11(&(0x7f0000000000)={0xff, 0xff, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]}, 0x00)",
@@ -120,6 +118,38 @@ func TestAssignSize(t *testing.T) {
 		{
 			"syz_test$length20(&(0x7f0000000000)={{{0xff, 0xff, 0xff, 0xff}, 0xff, 0xff, 0xff}, 0xff, 0xff})",
 			"syz_test$length20(&(0x7f0000000000)={{{0x4, 0x4, 0x7, 0x9}, 0x7, 0x7, 0x9}, 0x9, 0x9})",
+		},
+		{
+			"syz_test$length21(&(0x7f0000000000)=0x0, 0x0)",
+			"syz_test$length21(&(0x7f0000000000), 0x40)",
+		},
+		{
+			"syz_test$length22(&(0x7f0000000000)='12345', 0x0)",
+			"syz_test$length22(&(0x7f0000000000)='12345', 0x28)",
+		},
+		{
+			"syz_test$length23(&(0x7f0000000000)={0x1, {0x2, 0x0}})",
+			"syz_test$length23(&(0x7f0000000000)={0x1, {0x2, 0x6}})",
+		},
+		{
+			"syz_test$length24(&(0x7f0000000000)={{0x0, {0x0}}, {0x0, {0x0}}})",
+			"syz_test$length24(&(0x7f0000000000)={{0x0, {0x8}}, {0x0, {0x10}}})",
+		},
+		{
+			"syz_test$length26(&(0x7f0000000000), 0x0)",
+			"syz_test$length26(&(0x7f0000000000), 0x8)",
+		},
+		{
+			"syz_test$length27(&(0x7f0000000000), 0x0)",
+			"syz_test$length27(&(0x7f0000000000), 0x2a)",
+		},
+		{
+			"syz_test$length28(&(0x7f0000000000), 0x0)",
+			"syz_test$length28(&(0x7f0000000000), 0x2a)",
+		},
+		{
+			"syz_test$length29(&(0x7f0000000000)={'./a\\x00', './b/c\\x00', 0x0, 0x0, 0x0})",
+			"syz_test$length29(&(0x7f0000000000)={'./a\\x00', './b/c\\x00', 0xa, 0x14, 0x21})",
 		},
 	}
 

@@ -55,9 +55,6 @@ func (comp *compiler) genSyscalls() []*prog.Syscall {
 	sort.Slice(calls, func(i, j int) bool {
 		return calls[i].Name < calls[j].Name
 	})
-	for i, c := range calls {
-		c.ID = i
-	}
 	return calls
 }
 
@@ -133,6 +130,7 @@ func (comp *compiler) genStructDescs(syscalls []*prog.Syscall) []*prog.KeyedStru
 			if !checkStruct(t.Key, &t.StructDesc) {
 				return
 			}
+			structNode := comp.structNodes[t.StructDesc]
 			// Add paddings, calculate size, mark bitfields.
 			varlen := false
 			for _, f := range t.Fields {
@@ -141,7 +139,7 @@ func (comp *compiler) genStructDescs(syscalls []*prog.Syscall) []*prog.KeyedStru
 				}
 			}
 			comp.markBitfields(t.Fields)
-			packed, alignAttr := comp.parseStructAttrs(comp.structNodes[t.StructDesc])
+			packed, sizeAttr, alignAttr := comp.parseStructAttrs(structNode)
 			t.Fields = comp.addAlignment(t.Fields, varlen, packed, alignAttr)
 			t.AlignAttr = alignAttr
 			t.TypeSize = 0
@@ -151,18 +149,39 @@ func (comp *compiler) genStructDescs(syscalls []*prog.Syscall) []*prog.KeyedStru
 						t.TypeSize += f.Size()
 					}
 				}
+				if sizeAttr != sizeUnassigned {
+					if t.TypeSize > sizeAttr {
+						comp.error(structNode.Pos, "struct %v has size attribute %v"+
+							" which is less than struct size %v",
+							structNode.Name.Name, sizeAttr, t.TypeSize)
+					}
+					if pad := sizeAttr - t.TypeSize; pad != 0 {
+						t.Fields = append(t.Fields, genPad(pad))
+					}
+					t.TypeSize = sizeAttr
+				}
 			}
 		case *prog.UnionType:
 			if !checkStruct(t.Key, &t.StructDesc) {
 				return
 			}
+			structNode := comp.structNodes[t.StructDesc]
+			varlen, sizeAttr := comp.parseUnionAttrs(structNode)
 			t.TypeSize = 0
-			varlen := comp.parseUnionAttrs(comp.structNodes[t.StructDesc])
 			if !varlen {
 				for _, fld := range t.Fields {
-					if t.TypeSize < fld.Size() {
-						t.TypeSize = fld.Size()
+					sz := fld.Size()
+					if sizeAttr != sizeUnassigned && sz > sizeAttr {
+						comp.error(structNode.Pos, "union %v has size attribute %v"+
+							" which is less than field %v size %v",
+							structNode.Name.Name, sizeAttr, fld.Name(), sz)
 					}
+					if t.TypeSize < sz {
+						t.TypeSize = sz
+					}
+				}
+				if sizeAttr != sizeUnassigned {
+					t.TypeSize = sizeAttr
 				}
 			}
 		}
@@ -200,34 +219,15 @@ func (comp *compiler) genStructDescs(syscalls []*prog.Syscall) []*prog.KeyedStru
 	return structs
 }
 
-func (comp *compiler) genStructDesc(res *prog.StructDesc, n *ast.Struct, dir prog.Dir) {
+func (comp *compiler) genStructDesc(res *prog.StructDesc, n *ast.Struct, dir prog.Dir, varlen bool) {
 	// Leave node for genStructDescs to calculate size/padding.
 	comp.structNodes[res] = n
+	common := genCommon(n.Name.Name, "", sizeUnassigned, dir, false)
+	common.IsVarlen = varlen
 	*res = prog.StructDesc{
-		TypeCommon: genCommon(n.Name.Name, "", sizeUnassigned, dir, false),
+		TypeCommon: common,
 		Fields:     comp.genFieldArray(n.Fields, dir, false),
 	}
-}
-
-func (comp *compiler) isStructVarlen(name string) bool {
-	if varlen, ok := comp.structVarlen[name]; ok {
-		return varlen
-	}
-	s := comp.structs[name]
-	if s.IsUnion && comp.parseUnionAttrs(s) {
-		comp.structVarlen[name] = true
-		return true
-	}
-	comp.structVarlen[name] = false // to not hang on recursive types
-	varlen := false
-	for _, fld := range s.Fields {
-		if comp.isVarlen(fld.Type) {
-			varlen = true
-			break
-		}
-	}
-	comp.structVarlen[name] = varlen
-	return varlen
 }
 
 func (comp *compiler) markBitfields(fields []prog.Type) {
@@ -274,7 +274,9 @@ func (comp *compiler) addAlignment(fields []prog.Type, varlen, packed bool, alig
 		if !varlen && alignAttr != 0 {
 			size := uint64(0)
 			for _, f := range fields {
-				size += f.Size()
+				if !f.BitfieldMiddle() {
+					size += f.Size()
+				}
 			}
 			if tail := size % alignAttr; tail != 0 {
 				newFields = append(newFields, genPad(alignAttr-tail))
@@ -284,7 +286,7 @@ func (comp *compiler) addAlignment(fields []prog.Type, varlen, packed bool, alig
 	}
 	var align, off uint64
 	for i, f := range fields {
-		if i > 0 && !fields[i-1].BitfieldMiddle() {
+		if i == 0 || !fields[i-1].BitfieldMiddle() {
 			a := comp.typeAlign(f)
 			if align < a {
 				align = a
@@ -328,7 +330,7 @@ func (comp *compiler) typeAlign(t0 prog.Type) uint64 {
 	case *prog.ArrayType:
 		return comp.typeAlign(t.Type)
 	case *prog.StructType:
-		packed, alignAttr := comp.parseStructAttrs(comp.structNodes[t.StructDesc])
+		packed, _, alignAttr := comp.parseStructAttrs(comp.structNodes[t.StructDesc])
 		if alignAttr != 0 {
 			return alignAttr // overrided by user attribute
 		}
@@ -376,6 +378,10 @@ func (comp *compiler) genFieldArray(fields []*ast.Field, dir prog.Dir, isArg boo
 
 func (comp *compiler) genType(t *ast.Type, field string, dir prog.Dir, isArg bool) prog.Type {
 	desc, args, base := comp.getArgsBase(t, field, dir, isArg)
+	if desc.Gen == nil {
+		panic(fmt.Sprintf("no gen for %v %#v", field, t))
+	}
+	base.IsVarlen = desc.Varlen != nil && desc.Varlen(comp, t, args)
 	return desc.Gen(comp, t, args, base)
 }
 

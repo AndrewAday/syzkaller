@@ -2,15 +2,19 @@
 
 The operation of the syzkaller `syz-manager` process is governed by a configuration file, passed at
 invocation time with the `-config` option.  This configuration can be based on the
-[example](syz-manager/config/testdata/qemu.cfg); the file is in JSON format with the
+[example](/syz-manager/mgrconfig/testdata/qemu.cfg); the file is in JSON format with the
 following keys in its top-level object:
 
  - `http`: URL that will display information about the running `syz-manager` process.
+ - `email_addrs`: Optional list of email addresses to receive notifications when bugs are encountered for the first time.
+   Mailx is the only supported mailer. Please set it up prior to using this function.
  - `workdir`: Location of a working directory for the `syz-manager` process. Outputs here include:
      - `<workdir>/crashes/*`: crash output files (see [Crash Reports](#crash-reports))
      - `<workdir>/corpus.db`: corpus with interesting programs
      - `<workdir>/instance-x`: per VM instance temporary files
- - `syzkaller`: Location of the `syzkaller` checkout.
+ - `syzkaller`: Location of the `syzkaller` checkout, `syz-manager` will look
+   for binaries in `bin` subdir (does not have to be `syzkaller` checkout as
+   long as it preserves `bin` dir structure)
  - `vmlinux`: Location of the `vmlinux` file that corresponds to the kernel being tested
    (used for report symbolization and coverage reports, optional).
  - `procs`: Number of parallel test processes in each VM (4 or 8 would be a reasonable number).
@@ -37,4 +41,4 @@ following keys in its top-level object:
      - `cpu`: Number of CPUs to simulate in the VM (*not currently used*).
      - `mem`: Amount of memory (in MiB) for the VM; this is passed as the `-m` option to `qemu-system-x86_64`.
 
-See also [config.go](syz-manager/config/config.go) for all config parameters.
+See also [config.go](/syz-manager/mgrconfig/mgrconfig.go) for all config parameters.

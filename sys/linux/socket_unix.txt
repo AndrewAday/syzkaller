@@ -5,6 +5,7 @@
 
 include <linux/socket.h>
 include <linux/net.h>
+include <uapi/linux/un.h>
 
 resource sock_unix[sock]
 
@@ -33,17 +34,17 @@ unix_pair {
 sockaddr_un [
 	file	sockaddr_un_file
 	abs	sockaddr_un_abstract
-] [varlen]
+]
 
 sockaddr_un_file {
 	family	flags[unix_socket_family, int16]
-	path	filename
-} [packed]
+	path	string[filename, UNIX_PATH_MAX]
+}
 
 sockaddr_un_abstract {
 	family	flags[unix_socket_family, int16]
 	ind	const[0, int8]
-	id	proc[20000, 4, int32]
+	id	int32[20000:20004]
 }
 
 msghdr_un {
@@ -52,7 +53,7 @@ msghdr_un {
 	vec	ptr[in, array[iovec_in]]
 	vlen	len[vec, intptr]
 	ctrl	ptr[in, array[cmsghdr_un], opt]
-	ctrllen	len[ctrl, intptr]
+	ctrllen	bytesize[ctrl, intptr]
 	f	flags[send_flags, int32]
 }
 

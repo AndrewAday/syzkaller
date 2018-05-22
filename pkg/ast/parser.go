@@ -88,13 +88,13 @@ type parser struct {
 }
 
 // Skip parsing till the next NEWLINE, for error recovery.
-var skipLine = errors.New("")
+var errSkipLine = errors.New("")
 
 func (p *parser) parseTopRecover() Node {
 	defer func() {
 		switch err := recover(); err {
 		case nil:
-		case skipLine:
+		case errSkipLine:
 			// Try to recover by consuming everything until next NEWLINE.
 			for p.tok != tokNewLine && p.tok != tokEOF {
 				p.next()
@@ -128,6 +128,9 @@ func (p *parser) parseTop() Node {
 		return p.parseResource()
 	case tokIdent:
 		name := p.parseIdent()
+		if name.Name == "type" {
+			return p.parseTypeDef()
+		}
 		switch p.tok {
 		case tokLParen:
 			return p.parseCall(name)
@@ -140,7 +143,7 @@ func (p *parser) parseTop() Node {
 		}
 	case tokIllegal:
 		// Scanner has already producer an error for this one.
-		panic(skipLine)
+		panic(errSkipLine)
 	default:
 		p.expect(tokComment, tokDefine, tokInclude, tokResource, tokIdent)
 	}
@@ -175,7 +178,7 @@ func (p *parser) expect(tokens ...token) {
 		str = append(str, tok.String())
 	}
 	p.s.Error(p.pos, fmt.Sprintf("unexpected %v, expecting %v", p.tok, strings.Join(str, ", ")))
-	panic(skipLine)
+	panic(errSkipLine)
 }
 
 func (p *parser) parseComment() *Comment {
@@ -242,6 +245,40 @@ func (p *parser) parseResource() *Resource {
 		Name:   name,
 		Base:   base,
 		Values: values,
+	}
+}
+
+func (p *parser) parseTypeDef() *TypeDef {
+	pos0 := p.pos
+	name := p.parseIdent()
+	var typ *Type
+	var str *Struct
+	var args []*Ident
+	p.expect(tokLBrack, tokIdent)
+	if p.tryConsume(tokLBrack) {
+		args = append(args, p.parseIdent())
+		for p.tryConsume(tokComma) {
+			args = append(args, p.parseIdent())
+		}
+		p.consume(tokRBrack)
+		if p.tok == tokLBrace || p.tok == tokLBrack {
+			name := &Ident{
+				Pos:  pos0,
+				Name: "",
+			}
+			str = p.parseStruct(name)
+		} else {
+			typ = p.parseType()
+		}
+	} else {
+		typ = p.parseType()
+	}
+	return &TypeDef{
+		Pos:    pos0,
+		Name:   name,
+		Args:   args,
+		Type:   typ,
+		Struct: str,
 	}
 }
 
@@ -339,9 +376,9 @@ func (p *parser) parseStruct(name *Ident) *Struct {
 		p.consume(tokNewLine)
 	}
 	if p.tryConsume(tokLBrack) {
-		str.Attrs = append(str.Attrs, p.parseIdent())
+		str.Attrs = append(str.Attrs, p.parseType())
 		for p.tryConsume(tokComma) {
-			str.Attrs = append(str.Attrs, p.parseIdent())
+			str.Attrs = append(str.Attrs, p.parseType())
 		}
 		p.consume(tokRBrack)
 	}
@@ -376,12 +413,13 @@ func (p *parser) parseType() *Type {
 	switch p.tok {
 	case tokInt:
 		allowColon = true
-		arg.Value, arg.ValueHex = p.parseIntValue()
+		arg.Value, arg.valueFmt = p.parseIntValue()
 	case tokIdent:
 		allowColon = true
 		arg.Ident = p.lit
 	case tokString:
 		arg.String = p.lit
+		arg.HasString = true
 	default:
 		p.expect(tokInt, tokIdent, tokString)
 	}
@@ -391,7 +429,7 @@ func (p *parser) parseType() *Type {
 		arg.Pos2 = p.pos
 		switch p.tok {
 		case tokInt:
-			arg.Value2, arg.Value2Hex = p.parseIntValue()
+			arg.Value2, arg.value2Fmt = p.parseIntValue()
 		case tokIdent:
 			arg.Ident2 = p.lit
 		default:
@@ -441,7 +479,7 @@ func (p *parser) parseInt() *Int {
 	}
 	switch p.tok {
 	case tokInt:
-		i.Value, i.ValueHex = p.parseIntValue()
+		i.Value, i.valueFmt = p.parseIntValue()
 	case tokIdent:
 		i.Ident = p.lit
 	default:
@@ -451,13 +489,16 @@ func (p *parser) parseInt() *Int {
 	return i
 }
 
-func (p *parser) parseIntValue() (uint64, bool) {
+func (p *parser) parseIntValue() (uint64, intFmt) {
+	if p.lit[0] == '\'' {
+		return uint64(p.lit[1]), intFmtChar
+	}
 	if v, err := strconv.ParseUint(p.lit, 10, 64); err == nil {
-		return v, false
+		return v, intFmtDec
 	}
 	if len(p.lit) > 2 && p.lit[0] == '0' && p.lit[1] == 'x' {
 		if v, err := strconv.ParseUint(p.lit[2:], 16, 64); err == nil {
-			return v, true
+			return v, intFmtHex
 		}
 	}
 	panic(fmt.Sprintf("scanner returned bad integer %q", p.lit))

@@ -35,7 +35,7 @@ func TestBisect(t *testing.T) {
 			var prog prog.LogEntry
 			if rd.Intn(30) == 0 {
 				prog.Proc = 42
-				numGuilty += 1
+				numGuilty++
 			}
 			progs = append(progs, &prog)
 		}
@@ -43,13 +43,13 @@ func TestBisect(t *testing.T) {
 			var prog prog.LogEntry
 			prog.Proc = 42
 			progs = append(progs, &prog)
-			numGuilty += 1
+			numGuilty++
 		}
 		progs, _ = ctx.bisectProgs(progs, func(p []*prog.LogEntry) (bool, error) {
 			guilty := 0
 			for _, prog := range p {
 				if prog.Proc == 42 {
-					guilty += 1
+					guilty++
 				}
 			}
 			return guilty == numGuilty, nil
@@ -67,16 +67,19 @@ func TestBisect(t *testing.T) {
 
 func TestSimplifies(t *testing.T) {
 	opts := csource.Options{
-		Threaded:   true,
-		Collide:    true,
-		Repeat:     true,
-		Procs:      10,
-		Sandbox:    "namespace",
-		EnableTun:  true,
-		UseTmpDir:  true,
-		HandleSegv: true,
-		WaitRepeat: true,
-		Repro:      true,
+		Threaded:      true,
+		Collide:       true,
+		Repeat:        true,
+		Procs:         10,
+		Sandbox:       "namespace",
+		EnableTun:     true,
+		EnableCgroups: true,
+		EnableNetdev:  true,
+		ResetNet:      true,
+		UseTmpDir:     true,
+		HandleSegv:    true,
+		WaitRepeat:    true,
+		Repro:         true,
 	}
 	var check func(opts csource.Options, i int)
 	check = func(opts csource.Options, i int) {

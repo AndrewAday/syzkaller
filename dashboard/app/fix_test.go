@@ -11,34 +11,6 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 )
 
-func reportAllBugs(c *Ctx, expect int) []*dashapi.BugReport {
-	pr := &dashapi.PollRequest{
-		Type: "test",
-	}
-	resp := new(dashapi.PollResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll", pr, resp))
-	if len(resp.Reports) != expect {
-		c.t.Fatalf("\n%v: want %v reports, got %v", caller(0), expect, len(resp.Reports))
-	}
-	for _, rep := range resp.Reports {
-		reproLevel := dashapi.ReproLevelNone
-		if len(rep.ReproC) != 0 {
-			reproLevel = dashapi.ReproLevelC
-		} else if len(rep.ReproSyz) != 0 {
-			reproLevel = dashapi.ReproLevelSyz
-		}
-		cmd := &dashapi.BugUpdate{
-			ID:         rep.ID,
-			Status:     dashapi.BugStatusOpen,
-			ReproLevel: reproLevel,
-		}
-		reply := new(dashapi.BugUpdateReply)
-		c.expectOK(c.API(client1, key1, "reporting_update", cmd, reply))
-		c.expectEQ(reply.OK, true)
-	}
-	return resp.Reports
-}
-
 // Basic scenario of marking a bug as fixed by a particular commit,
 // discovering this commit on builder and marking the bug as ultimately fixed.
 func TestFixBasic(t *testing.T) {
@@ -152,7 +124,7 @@ func TestFixedByTwoCommits(t *testing.T) {
 	cmd := &dashapi.BugUpdate{
 		ID:         rep.ID,
 		Status:     dashapi.BugStatusOpen,
-		FixCommits: []string{"bar: prepare for fixing", "foo: fix the crash"},
+		FixCommits: []string{"bar: prepare for fixing", "\"foo: fix the crash\""},
 	}
 	reply := new(dashapi.BugUpdateReply)
 	c.expectOK(c.API(client1, key1, "reporting_update", cmd, reply))
@@ -437,4 +409,60 @@ func TestReFixedTwoManagers(t *testing.T) {
 	c.expectOK(c.API(client1, key1, "report_crash", crash1, nil))
 	reports = reportAllBugs(c, 1)
 	c.expectEQ(reports[0].Title, "title1 (2)")
+}
+
+// TestFixedWithCommitTags tests fixing of bugs with Reported-by commit tags.
+func TestFixedWithCommitTags(t *testing.T) {
+	c := NewCtx(t)
+	defer c.Close()
+
+	build1 := testBuild(1)
+	c.expectOK(c.API(client1, key1, "upload_build", build1, nil))
+
+	build2 := testBuild(2)
+	c.expectOK(c.API(client1, key1, "upload_build", build2, nil))
+
+	crash1 := testCrash(build1, 1)
+	c.expectOK(c.API(client1, key1, "report_crash", crash1, nil))
+
+	rep := reportAllBugs(c, 1)[0]
+
+	// Upload build with 2 fixing commits for this bug.
+	build1.FixCommits = []dashapi.FixCommit{{"fix commit 1", rep.ID}, {"fix commit 2", rep.ID}}
+	c.expectOK(c.API(client1, key1, "upload_build", build1, nil))
+
+	// Now the commits must be associated with the bug and the second
+	// manager must get them as pending.
+	builderPollReq := &dashapi.BuilderPollReq{build2.Manager}
+	builderPollResp := new(dashapi.BuilderPollResp)
+	c.expectOK(c.API(client1, key1, "builder_poll", builderPollReq, builderPollResp))
+	c.expectEQ(len(builderPollResp.PendingCommits), 2)
+	c.expectEQ(builderPollResp.PendingCommits[0], "fix commit 1")
+	c.expectEQ(builderPollResp.PendingCommits[1], "fix commit 2")
+
+	// The first manager must not get them.
+	builderPollReq = &dashapi.BuilderPollReq{build1.Manager}
+	builderPollResp = new(dashapi.BuilderPollResp)
+	c.expectOK(c.API(client1, key1, "builder_poll", builderPollReq, builderPollResp))
+	c.expectEQ(len(builderPollResp.PendingCommits), 0)
+
+	// The bug is still not fixed.
+	c.expectOK(c.API(client1, key1, "report_crash", crash1, nil))
+	reportAllBugs(c, 0)
+
+	// Now the second manager reports the same commits.
+	// This must close the bug.
+	build2.FixCommits = build1.FixCommits
+	c.expectOK(c.API(client1, key1, "upload_build", build2, nil))
+
+	// Commits must not be passed to managers.
+	builderPollReq = &dashapi.BuilderPollReq{build2.Manager}
+	builderPollResp = new(dashapi.BuilderPollResp)
+	c.expectOK(c.API(client1, key1, "builder_poll", builderPollReq, builderPollResp))
+	c.expectEQ(len(builderPollResp.PendingCommits), 0)
+
+	// Ensure that a new crash creates a new bug.
+	c.expectOK(c.API(client1, key1, "report_crash", crash1, nil))
+	rep = reportAllBugs(c, 1)[0]
+	c.expectEQ(rep.Title, "title1 (2)")
 }

@@ -6,8 +6,9 @@ package symbolizer
 import (
 	"bufio"
 	"bytes"
-	"os/exec"
 	"strconv"
+
+	"github.com/google/syzkaller/pkg/osutil"
 )
 
 type Symbol struct {
@@ -17,7 +18,7 @@ type Symbol struct {
 
 // ReadSymbols returns list of text symbols in the binary bin.
 func ReadSymbols(bin string) (map[string][]Symbol, error) {
-	cmd := exec.Command("nm", "-nS", bin)
+	cmd := osutil.Command("nm", "-nS", bin)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err
@@ -33,7 +34,7 @@ func ReadSymbols(bin string) (map[string][]Symbol, error) {
 	for s.Scan() {
 		// A line looks as: "ffffffff8104db90 0000000000000059 t snb_uncore_msr_enable_box"
 		ln := s.Bytes()
-		if bytes.Index(ln, text[0]) == -1 && bytes.Index(ln, text[1]) == -1 {
+		if !bytes.Contains(ln, text[0]) && !bytes.Contains(ln, text[1]) {
 			continue
 		}
 		sp1 := bytes.IndexByte(ln, ' ')

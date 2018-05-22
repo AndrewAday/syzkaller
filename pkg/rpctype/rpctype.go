@@ -5,16 +5,21 @@
 // between various parts of the system.
 package rpctype
 
-type RpcInput struct {
+import (
+	"github.com/google/syzkaller/pkg/signal"
+)
+
+type RPCInput struct {
 	Call   string
 	Prog   []byte
-	Signal []uint32
 	Cover  []uint32
+	Signal signal.Serial
 }
 
-type RpcCandidate struct {
+type RPCCandidate struct {
 	Prog      []byte
 	Minimized bool
+	Smashed   bool
 }
 
 type ConnectArgs struct {
@@ -23,11 +28,11 @@ type ConnectArgs struct {
 
 type ConnectRes struct {
 	Prios        [][]float32
-	Inputs       []RpcInput
-	MaxSignal    []uint32
-	Candidates   []RpcCandidate
+	Inputs       []RPCInput
+	MaxSignal    signal.Serial
+	Candidates   []RPCCandidate
 	Lineage	     map[string]struct{}
-	EnabledCalls string
+	EnabledCalls []int
 	NeedCheck    bool
 }
 
@@ -39,6 +44,7 @@ type CheckArgs struct {
 	UserNamespaces bool
 	CompsSupported bool
 	Calls          []string
+	DisabledCalls  []SyscallReason
 	FuzzerGitRev   string
 	FuzzerSyzRev   string
 	ExecutorGitRev string
@@ -46,22 +52,28 @@ type CheckArgs struct {
 	ExecutorArch   string
 }
 
+type SyscallReason struct {
+	Name   string
+	Reason string
+}
+
 type NewInputArgs struct {
 	Name string
-	RpcInput
 	Sig string
+	RPCInput
 }
 
 type PollArgs struct {
-	Name      string
-	MaxSignal []uint32
-	Stats     map[string]uint64
+	Name           string
+	NeedCandidates bool
+	MaxSignal      signal.Serial
+	Stats          map[string]uint64
 }
 
 type PollRes struct {
-	Candidates []RpcCandidate
-	NewInputs  []RpcInput
-	MaxSignal  []uint32
+	Candidates []RPCCandidate
+	NewInputs  []RPCInput
+	MaxSignal  signal.Serial
 	Lineage    map[string]struct{}
 }
 

@@ -25,6 +25,16 @@ func FormatWriter(w io.Writer, desc *Description) {
 	}
 }
 
+func SerializeNode(n Node) string {
+	s, ok := n.(serializer)
+	if !ok {
+		panic(fmt.Sprintf("unknown node: %#v", n))
+	}
+	buf := new(bytes.Buffer)
+	s.serialize(buf)
+	return buf.String()
+}
+
 type serializer interface {
 	serialize(w io.Writer)
 }
@@ -52,23 +62,25 @@ func (def *Define) serialize(w io.Writer) {
 func (res *Resource) serialize(w io.Writer) {
 	fmt.Fprintf(w, "resource %v[%v]", res.Name.Name, fmtType(res.Base))
 	for i, v := range res.Values {
-		if i == 0 {
-			fmt.Fprintf(w, ": ")
-		} else {
-			fmt.Fprintf(w, ", ")
-		}
-		fmt.Fprintf(w, "%v", fmtInt(v))
+		fmt.Fprintf(w, "%v%v", comma(i, ": "), fmtInt(v))
 	}
 	fmt.Fprintf(w, "\n")
+}
+
+func (typedef *TypeDef) serialize(w io.Writer) {
+	fmt.Fprintf(w, "type %v%v", typedef.Name.Name, fmtIdentList(typedef.Args))
+	if typedef.Type != nil {
+		fmt.Fprintf(w, " %v\n", fmtType(typedef.Type))
+	}
+	if typedef.Struct != nil {
+		typedef.Struct.serialize(w)
+	}
 }
 
 func (c *Call) serialize(w io.Writer) {
 	fmt.Fprintf(w, "%v(", c.Name.Name)
 	for i, a := range c.Args {
-		if i != 0 {
-			fmt.Fprintf(w, ", ")
-		}
-		fmt.Fprintf(w, "%v", fmtField(a))
+		fmt.Fprintf(w, "%v%v", comma(i, ""), fmtField(a))
 	}
 	fmt.Fprintf(w, ")")
 	if c.Ret != nil {
@@ -109,12 +121,8 @@ func (str *Struct) serialize(w io.Writer) {
 		fmt.Fprintf(w, "#%v\n", com.Text)
 	}
 	fmt.Fprintf(w, "%c", closing)
-	if len(str.Attrs) != 0 {
-		fmt.Fprintf(w, " [")
-		for i, attr := range str.Attrs {
-			fmt.Fprintf(w, "%v%v", comma(i), attr.Name)
-		}
-		fmt.Fprintf(w, "]")
+	if attrs := fmtTypeList(str.Attrs); attrs != "" {
+		fmt.Fprintf(w, " %v", attrs)
 	}
 	fmt.Fprintf(w, "\n")
 }
@@ -122,10 +130,7 @@ func (str *Struct) serialize(w io.Writer) {
 func (flags *IntFlags) serialize(w io.Writer) {
 	fmt.Fprintf(w, "%v = ", flags.Name.Name)
 	for i, v := range flags.Values {
-		if i != 0 {
-			fmt.Fprintf(w, ", ")
-		}
-		fmt.Fprintf(w, "%v", fmtInt(v))
+		fmt.Fprintf(w, "%v%v", comma(i, ""), fmtInt(v))
 	}
 	fmt.Fprintf(w, "\n")
 }
@@ -133,10 +138,7 @@ func (flags *IntFlags) serialize(w io.Writer) {
 func (flags *StrFlags) serialize(w io.Writer) {
 	fmt.Fprintf(w, "%v = ", flags.Name.Name)
 	for i, v := range flags.Values {
-		if i != 0 {
-			fmt.Fprintf(w, ", ")
-		}
-		fmt.Fprintf(w, "\"%v\"", v.Value)
+		fmt.Fprintf(w, "%v\"%v\"", comma(i, ""), v.Value)
 	}
 	fmt.Fprintf(w, "\n")
 }
@@ -145,22 +147,26 @@ func fmtField(f *Field) string {
 	return fmt.Sprintf("%v %v", f.Name.Name, fmtType(f.Type))
 }
 
+func (n *Type) serialize(w io.Writer) {
+	w.Write([]byte(fmtType(n)))
+}
+
 func fmtType(t *Type) string {
 	v := ""
 	switch {
 	case t.Ident != "":
 		v = t.Ident
-	case t.String != "":
+	case t.HasString:
 		v = fmt.Sprintf("\"%v\"", t.String)
 	default:
-		v = fmtIntValue(t.Value, t.ValueHex)
+		v = fmtIntValue(t.Value, t.valueFmt)
 	}
 	if t.HasColon {
 		switch {
 		case t.Ident2 != "":
 			v += fmt.Sprintf(":%v", t.Ident2)
 		default:
-			v += fmt.Sprintf(":%v", fmtIntValue(t.Value2, t.Value2Hex))
+			v += fmt.Sprintf(":%v", fmtIntValue(t.Value2, t.value2Fmt))
 		}
 	}
 	v += fmtTypeList(t.Args)
@@ -174,7 +180,20 @@ func fmtTypeList(args []*Type) string {
 	w := new(bytes.Buffer)
 	fmt.Fprintf(w, "[")
 	for i, t := range args {
-		fmt.Fprintf(w, "%v%v", comma(i), fmtType(t))
+		fmt.Fprintf(w, "%v%v", comma(i, ""), fmtType(t))
+	}
+	fmt.Fprintf(w, "]")
+	return w.String()
+}
+
+func fmtIdentList(args []*Ident) string {
+	if len(args) == 0 {
+		return ""
+	}
+	w := new(bytes.Buffer)
+	fmt.Fprintf(w, "[")
+	for i, arg := range args {
+		fmt.Fprintf(w, "%v%v", comma(i, ""), arg.Name)
 	}
 	fmt.Fprintf(w, "]")
 	return w.String()
@@ -187,20 +206,26 @@ func fmtInt(i *Int) string {
 	case i.CExpr != "":
 		return fmt.Sprintf("%v", i.CExpr)
 	default:
-		return fmtIntValue(i.Value, i.ValueHex)
+		return fmtIntValue(i.Value, i.valueFmt)
 	}
 }
 
-func fmtIntValue(v uint64, hex bool) string {
-	if hex {
+func fmtIntValue(v uint64, format intFmt) string {
+	switch format {
+	case intFmtDec:
+		return fmt.Sprint(v)
+	case intFmtHex:
 		return fmt.Sprintf("0x%x", v)
+	case intFmtChar:
+		return fmt.Sprintf("'%c'", v)
+	default:
+		panic(fmt.Sprintf("unknown int format %v", format))
 	}
-	return fmt.Sprint(v)
 }
 
-func comma(i int) string {
+func comma(i int, or string) string {
 	if i == 0 {
-		return ""
+		return or
 	}
 	return ", "
 }

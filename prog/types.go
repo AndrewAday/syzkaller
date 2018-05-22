@@ -24,7 +24,21 @@ const (
 	DirInOut
 )
 
+func (dir Dir) String() string {
+	switch dir {
+	case DirIn:
+		return "in"
+	case DirOut:
+		return "out"
+	case DirInOut:
+		return "inout"
+	default:
+		panic("unknown dir")
+	}
+}
+
 type Type interface {
+	String() string
 	Name() string
 	FieldName() string
 	Dir() Dir
@@ -35,6 +49,9 @@ type Type interface {
 	BitfieldOffset() uint64
 	BitfieldLength() uint64
 	BitfieldMiddle() bool // returns true for all but last bitfield in a group
+
+	generate(r *randGen, s *state) (arg Arg, calls []*Call)
+	mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool)
 }
 
 func IsPad(t Type) bool {
@@ -50,6 +67,7 @@ type TypeCommon struct {
 	TypeSize   uint64 // static size of the type, or 0 for variable size types
 	ArgDir     Dir
 	IsOptional bool
+	IsVarlen   bool
 }
 
 func (t *TypeCommon) Name() string {
@@ -69,14 +87,14 @@ func (t *TypeCommon) Default() uint64 {
 }
 
 func (t *TypeCommon) Size() uint64 {
-	if t.Varlen() {
+	if t.IsVarlen {
 		panic(fmt.Sprintf("static type size is not known: %#v", t))
 	}
 	return t.TypeSize
 }
 
 func (t *TypeCommon) Varlen() bool {
-	return t.TypeSize == 0
+	return t.IsVarlen
 }
 
 func (t *TypeCommon) BitfieldOffset() uint64 {
@@ -107,6 +125,10 @@ type ResourceType struct {
 	Desc *ResourceDesc
 }
 
+func (t *ResourceType) String() string {
+	return t.Name()
+}
+
 func (t *ResourceType) Default() uint64 {
 	return t.Desc.Values[0]
 }
@@ -121,6 +143,10 @@ type IntTypeCommon struct {
 	BitfieldLen uint64
 	BigEndian   bool
 	BitfieldMdl bool
+}
+
+func (t *IntTypeCommon) String() string {
+	return t.Name()
 }
 
 func (t *IntTypeCommon) BitfieldOffset() uint64 {
@@ -139,6 +165,13 @@ type ConstType struct {
 	IntTypeCommon
 	Val   uint64
 	IsPad bool
+}
+
+func (t *ConstType) String() string {
+	if t.IsPad {
+		return fmt.Sprintf("pad[%v]", t.Size())
+	}
+	return fmt.Sprintf("const[%v, %v]", t.Val, t.IntTypeCommon.String())
 }
 
 type IntKind int
@@ -163,14 +196,19 @@ type FlagsType struct {
 
 type LenType struct {
 	IntTypeCommon
-	ByteSize uint64 // want size in multiple of bytes instead of array size
-	Buf      string
+	BitSize uint64 // want size in multiple of bits instead of array size
+	Buf     string
 }
 
 type ProcType struct {
 	IntTypeCommon
 	ValuesStart   uint64
 	ValuesPerProc uint64
+}
+
+func (t *ProcType) Default() uint64 {
+	// Special value denoting 0 for all procs.
+	return 0xffffffffffffffff
 }
 
 type CsumKind int
@@ -187,10 +225,18 @@ type CsumType struct {
 	Protocol uint64 // for CsumPseudo
 }
 
+func (t *CsumType) String() string {
+	return "csum"
+}
+
 type VmaType struct {
 	TypeCommon
 	RangeBegin uint64 // in pages
 	RangeEnd   uint64
+}
+
+func (t *VmaType) String() string {
+	return "vma"
 }
 
 type BufferKind int
@@ -206,11 +252,11 @@ const (
 type TextKind int
 
 const (
-	Text_x86_real TextKind = iota
-	Text_x86_16
-	Text_x86_32
-	Text_x86_64
-	Text_arm64
+	TextX86Real TextKind = iota
+	TextX86bit16
+	TextX86bit32
+	TextX86bit64
+	TextArm64
 )
 
 type BufferType struct {
@@ -221,6 +267,11 @@ type BufferType struct {
 	Text       TextKind // for BufferText
 	SubKind    string
 	Values     []string // possible values for BufferString kind
+	NoZ        bool     // non-zero terminated BufferString/BufferFilename
+}
+
+func (t *BufferType) String() string {
+	return "buffer"
 }
 
 type ArrayKind int
@@ -238,15 +289,27 @@ type ArrayType struct {
 	RangeEnd   uint64
 }
 
+func (t *ArrayType) String() string {
+	return fmt.Sprintf("array[%v]", t.Type.String())
+}
+
 type PtrType struct {
 	TypeCommon
 	Type Type
+}
+
+func (t *PtrType) String() string {
+	return fmt.Sprintf("ptr[%v, %v]", t.Dir(), t.Type.String())
 }
 
 type StructType struct {
 	Key     StructKey
 	FldName string
 	*StructDesc
+}
+
+func (t *StructType) String() string {
+	return t.Name()
 }
 
 func (t *StructType) FieldName() string {
@@ -257,6 +320,10 @@ type UnionType struct {
 	Key     StructKey
 	FldName string
 	*StructDesc
+}
+
+func (t *UnionType) String() string {
+	return t.Name()
 }
 
 func (t *UnionType) FieldName() string {

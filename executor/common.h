@@ -5,10 +5,15 @@
 
 #include <stdint.h>
 #include <string.h>
-#if defined(SYZ_EXECUTOR) || defined(SYZ_USE_TMP_DIR)
+#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||               \
+    defined(SYZ_USE_TMP_DIR) || defined(SYZ_TUN_ENABLE) || defined(SYZ_SANDBOX_NAMESPACE) ||    \
+    defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_FAULT_INJECTION) || \
+    defined(__NR_syz_kvm_setup_cpu) || defined(__NR_syz_init_net_socket)
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#endif
+#if defined(SYZ_EXECUTOR) || defined(SYZ_USE_TMP_DIR)
 #include <stdlib.h>
 #include <sys/stat.h>
 #endif
@@ -23,8 +28,37 @@
 #endif
 
 #if defined(SYZ_EXECUTOR)
-#ifndef SYSCALLAPI
+// exit/_exit do not necessary work (e.g. if fuzzer sets seccomp filter that prohibits exit_group).
+// Use doexit instead.  We must redefine exit to something that exists in stdlib,
+// because some standard libraries contain "using ::exit;", but has different signature.
+#define exit vsnprintf
+#define _exit vsnprintf
+
+// uint64 is impossible to printf without using the clumsy and verbose "%" PRId64.
+// So we define and use uint64. Note: pkg/csource does s/uint64/uint64/.
+// Also define uint32/16/8 for consistency.
+typedef unsigned long long uint64;
+typedef unsigned int uint32;
+typedef unsigned short uint16;
+typedef unsigned char uint8;
+
+#ifdef SYZ_EXECUTOR
+// Note: zircon max fd is 256.
+const int kInPipeFd = 250; // remapped from stdin
+const int kOutPipeFd = 251; // remapped from stdout
+#endif
+
+#if defined(__GNUC__)
 #define SYSCALLAPI
+#define NORETURN __attribute__((noreturn))
+#define ALIGNED(N) __attribute__((aligned(N)))
+#define PRINTF __attribute__((format(printf, 1, 2)))
+#else
+// Assuming windows/cl.
+#define SYSCALLAPI WINAPI
+#define NORETURN __declspec(noreturn)
+#define ALIGNED(N) __declspec(align(N))
+#define PRINTF
 #endif
 
 typedef long(SYSCALLAPI* syscall_t)(long, long, long, long, long, long, long, long, long);
@@ -38,11 +72,12 @@ struct call_t {
 // Defined in generated syscalls_OS.h files.
 extern call_t syscalls[];
 extern unsigned syscall_count;
-#endif
+#endif // #if defined(SYZ_EXECUTOR)
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||            \
-    defined(SYZ_USE_TMP_DIR) || defined(SYZ_TUN_ENABLE) || defined(SYZ_SANDBOX_NAMESPACE) || \
-    defined(SYZ_SANDBOX_SETUID) || defined(SYZ_FAULT_INJECTION) || defined(__NR_syz_kvm_setup_cpu)
+#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||               \
+    defined(SYZ_USE_TMP_DIR) || defined(SYZ_TUN_ENABLE) || defined(SYZ_SANDBOX_NAMESPACE) ||    \
+    defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_FAULT_INJECTION) || \
+    defined(__NR_syz_kvm_setup_cpu)
 const int kFailStatus = 67;
 const int kRetryStatus = 69;
 #endif
@@ -51,14 +86,15 @@ const int kRetryStatus = 69;
 const int kErrorStatus = 68;
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||            \
-    defined(SYZ_USE_TMP_DIR) || defined(SYZ_TUN_ENABLE) || defined(SYZ_SANDBOX_NAMESPACE) || \
-    defined(SYZ_SANDBOX_SETUID) || defined(SYZ_FAULT_INJECTION) || defined(__NR_syz_kvm_setup_cpu)
+#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT)) ||                  \
+    defined(SYZ_USE_TMP_DIR) || defined(SYZ_TUN_ENABLE) || defined(SYZ_SANDBOX_NAMESPACE) ||       \
+    defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(__NR_syz_kvm_setup_cpu) || \
+    defined(__NR_syz_init_net_socket) &&                                                           \
+	(defined(SYZ_SANDBOX_NONE) || defined(SYZ_SANDBOX_SETUID) || defined(SYZ_SANDBOX_NAMESPACE))
 // logical error (e.g. invalid input program), use as an assert() alernative
-NORETURN static void fail(const char* msg, ...)
+NORETURN PRINTF static void fail(const char* msg, ...)
 {
 	int e = errno;
-	fflush(stdout);
 	va_list args;
 	va_start(args, msg);
 	vfprintf(stderr, msg, args);
@@ -72,9 +108,8 @@ NORETURN static void fail(const char* msg, ...)
 
 #if defined(SYZ_EXECUTOR)
 // kernel error (e.g. wrong syscall return value)
-NORETURN static void error(const char* msg, ...)
+NORETURN PRINTF static void error(const char* msg, ...)
 {
-	fflush(stdout);
 	va_list args;
 	va_start(args, msg);
 	vfprintf(stderr, msg, args);
@@ -84,12 +119,11 @@ NORETURN static void error(const char* msg, ...)
 }
 #endif
 
-#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT))
+#if defined(SYZ_EXECUTOR) || (defined(SYZ_REPEAT) && defined(SYZ_WAIT_REPEAT) && defined(SYZ_USE_TMP_DIR)) || defined(SYZ_FAULT_INJECTION)
 // just exit (e.g. due to temporal ENOMEM error)
-NORETURN static void exitf(const char* msg, ...)
+NORETURN PRINTF static void exitf(const char* msg, ...)
 {
 	int e = errno;
-	fflush(stdout);
 	va_list args;
 	va_start(args, msg);
 	vfprintf(stderr, msg, args);
@@ -102,15 +136,15 @@ NORETURN static void exitf(const char* msg, ...)
 #if defined(SYZ_EXECUTOR) || defined(SYZ_DEBUG)
 static int flag_debug;
 
-static void debug(const char* msg, ...)
+PRINTF static void debug(const char* msg, ...)
 {
 	if (!flag_debug)
 		return;
 	va_list args;
 	va_start(args, msg);
-	vfprintf(stdout, msg, args);
+	vfprintf(stderr, msg, args);
 	va_end(args);
-	fflush(stdout);
+	fflush(stderr);
 }
 #endif
 
@@ -132,7 +166,7 @@ static void debug(const char* msg, ...)
 
 #if defined(SYZ_EXECUTOR) || defined(SYZ_USE_CHECKSUMS)
 struct csum_inet {
-	uint32_t acc;
+	uint32 acc;
 };
 
 static void csum_inet_init(struct csum_inet* csum)
@@ -140,23 +174,23 @@ static void csum_inet_init(struct csum_inet* csum)
 	csum->acc = 0;
 }
 
-static void csum_inet_update(struct csum_inet* csum, const uint8_t* data, size_t length)
+static void csum_inet_update(struct csum_inet* csum, const uint8* data, size_t length)
 {
 	if (length == 0)
 		return;
 
 	size_t i;
 	for (i = 0; i < length - 1; i += 2)
-		csum->acc += *(uint16_t*)&data[i];
+		csum->acc += *(uint16*)&data[i];
 
 	if (length & 1)
-		csum->acc += (uint16_t)data[length - 1];
+		csum->acc += (uint16)data[length - 1];
 
 	while (csum->acc > 0xffff)
 		csum->acc = (csum->acc & 0xffff) + (csum->acc >> 16);
 }
 
-static uint16_t csum_inet_digest(struct csum_inet* csum)
+static uint16 csum_inet_digest(struct csum_inet* csum)
 {
 	return ~csum->acc;
 }

@@ -5,7 +5,9 @@ package prog
 
 import (
 	"fmt"
+	"math/rand"
 	"sort"
+	"sync"
 )
 
 // Target describes target OS/arch pair.
@@ -15,6 +17,7 @@ type Target struct {
 	Revision   string // unique hash representing revision of the descriptions
 	PtrSize    uint64
 	PageSize   uint64
+	NumPages   uint64
 	DataOffset uint64
 
 	Syscalls  []*Syscall
@@ -22,40 +25,34 @@ type Target struct {
 	Structs   []*KeyedStruct
 	Consts    []ConstValue
 
-	// Syscall used by MakeMmap.
-	// It has some special meaning because there are usually too many of them.
-	MmapSyscall *Syscall
-
-	// MakeMmap creates call that maps [start, start+npages) page range.
-	MakeMmap func(start, npages uint64) *Call
-
-	// AnalyzeMmap analyzes the call c regarding mapping/unmapping memory.
-	// If it maps/unmaps any memory returns [start, start+npages) range,
-	// otherwise returns npages = 0.
-	AnalyzeMmap func(c *Call) (start, npages uint64, mapped bool)
+	// MakeMmap creates call that maps [addr, addr+size) memory range.
+	MakeMmap func(addr, size uint64) *Call
 
 	// SanitizeCall neutralizes harmful calls.
 	SanitizeCall func(c *Call)
 
-	// SpecialStructs allows target to do custom generation/mutation for some struct types.
-	// Map key is struct name for which custom generation/mutation is required.
+	// SpecialTypes allows target to do custom generation/mutation for some struct's and union's.
+	// Map key is struct/union name for which custom generation/mutation is required.
 	// Map value is custom generation/mutation function that will be called
-	// for the corresponding structs. g is helper object that allows generate random numbers,
-	// allocate memory, etc. typ is the struct type. old is the old value of the struct
-	// for mutation, or nil for generation. The function returns a new value of the struct,
+	// for the corresponding type. g is helper object that allows generate random numbers,
+	// allocate memory, etc. typ is the struct/union type. old is the old value of the struct/union
+	// for mutation, or nil for generation. The function returns a new value of the struct/union,
 	// and optionally any calls that need to be inserted before the arg reference.
-	SpecialStructs map[string]func(g *Gen, typ *StructType, old *GroupArg) (Arg, []*Call)
+	SpecialTypes map[string]func(g *Gen, typ Type, old Arg) (Arg, []*Call)
 
 	// Special strings that can matter for the target.
 	// Used as fallback when string type does not have own dictionary.
 	StringDictionary []string
 
 	// Filled by prog package:
+	init        sync.Once
+	initArch    func(target *Target)
 	SyscallMap  map[string]*Syscall
 	ConstMap    map[string]uint64
 	resourceMap map[string]*ResourceDesc
 	// Maps resource name to a list of calls that can create the resource.
 	resourceCtors map[string][]*Syscall
+	any           anyTypes
 }
 
 var targets = make(map[string]*Target)
@@ -65,10 +62,7 @@ func RegisterTarget(target *Target, initArch func(target *Target)) {
 	if targets[key] != nil {
 		panic(fmt.Sprintf("duplicate target %v", key))
 	}
-	target.SanitizeCall = func(c *Call) {}
-	initTarget(target)
-	initArch(target)
-	//target.ConstMap = nil // currently used only by initArch
+	target.initArch = initArch
 	targets[key] = target
 }
 
@@ -83,13 +77,15 @@ func GetTarget(OS, arch string) (*Target, error) {
 		sort.Strings(supported)
 		return nil, fmt.Errorf("unknown target: %v (supported: %v)", key, supported)
 	}
+	target.init.Do(target.lazyInit)
 	return target, nil
 }
 
 func AllTargets() []*Target {
 	var res []*Target
-	for _, t := range targets {
-		res = append(res, t)
+	for _, target := range targets {
+		target.init.Do(target.lazyInit)
+		res = append(res, target)
 	}
 	sort.Slice(res, func(i, j int) bool {
 		if res[i].OS != res[j].OS {
@@ -100,7 +96,14 @@ func AllTargets() []*Target {
 	return res
 }
 
-func initTarget(target *Target) {
+func (target *Target) lazyInit() {
+	target.SanitizeCall = func(c *Call) {}
+	target.initTarget()
+	target.initArch(target)
+	//target.ConstMap = nil
+}
+
+func (target *Target) initTarget() {
 	target.ConstMap = make(map[string]uint64)
 	for _, c := range target.Consts {
 		target.ConstMap[c.Name] = c.Value
@@ -118,7 +121,8 @@ func initTarget(target *Target) {
 	target.Structs = nil
 
 	target.SyscallMap = make(map[string]*Syscall)
-	for _, c := range target.Syscalls {
+	for i, c := range target.Syscalls {
+		c.ID = i
 		target.SyscallMap[c.Name] = c
 		ForeachType(c, func(t0 Type) {
 			switch t := t0.(type) {
@@ -145,6 +149,7 @@ func initTarget(target *Target) {
 	for _, res := range target.Resources {
 		target.resourceCtors[res.Name] = target.calcResourceCtors(res.Kind, false)
 	}
+	initAnyTypes(target)
 }
 
 type Gen struct {
@@ -152,10 +157,54 @@ type Gen struct {
 	s *state
 }
 
+func (g *Gen) Target() *Target {
+	return g.r.target
+}
+
+func (g *Gen) Rand() *rand.Rand {
+	return g.r.Rand
+}
+
 func (g *Gen) NOutOf(n, outOf int) bool {
 	return g.r.nOutOf(n, outOf)
 }
 
 func (g *Gen) Alloc(ptrType Type, data Arg) (Arg, []*Call) {
-	return g.r.addr(g.s, ptrType, data.Size(), data)
+	return g.r.allocAddr(g.s, ptrType, data.Size(), data), nil
+}
+
+func (g *Gen) GenerateArg(typ Type, pcalls *[]*Call) Arg {
+	return g.generateArg(typ, pcalls, false)
+}
+
+func (g *Gen) GenerateSpecialArg(typ Type, pcalls *[]*Call) Arg {
+	return g.generateArg(typ, pcalls, true)
+}
+
+func (g *Gen) generateArg(typ Type, pcalls *[]*Call, ignoreSpecial bool) Arg {
+	arg, calls := g.r.generateArgImpl(g.s, typ, ignoreSpecial)
+	*pcalls = append(*pcalls, calls...)
+	g.r.target.assignSizesArray([]Arg{arg})
+	return arg
+}
+
+func (g *Gen) MutateArg(arg0 Arg) (calls []*Call) {
+	updateSizes := true
+	for stop := false; !stop; stop = g.r.oneOf(3) {
+		ma := &mutationArgs{target: g.r.target, ignoreSpecial: true}
+		ForeachSubArg(arg0, ma.collectArg)
+		if len(ma.args) == 0 {
+			// TODO(dvyukov): probably need to return this condition
+			// and updateSizes to caller so that Mutate can act accordingly.
+			return
+		}
+		idx := g.r.Intn(len(ma.args))
+		arg, ctx := ma.args[idx], ma.ctxes[idx]
+		newCalls, ok := g.r.target.mutateArg(g.r, g.s, arg, ctx, &updateSizes)
+		if !ok {
+			continue
+		}
+		calls = append(calls, newCalls...)
+	}
+	return calls
 }

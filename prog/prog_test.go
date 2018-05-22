@@ -6,7 +6,10 @@ package prog
 import (
 	"bytes"
 	"fmt"
+	"math/rand"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestGeneration(t *testing.T) {
@@ -18,10 +21,14 @@ func TestGeneration(t *testing.T) {
 
 func TestDefault(t *testing.T) {
 	target, _, _ := initTest(t)
-	for _, meta := range target.SyscallMap {
-		for _, t := range meta.Args {
-			defaultArg(t)
-		}
+	for _, meta := range target.Syscalls {
+		ForeachType(meta, func(typ Type) {
+			arg := target.defaultArg(typ)
+			if !target.isDefaultArg(arg) {
+				t.Errorf("default arg is not default: %s\ntype: %#v\narg: %#v",
+					typ, typ, arg)
+			}
+		})
 	}
 }
 
@@ -63,7 +70,7 @@ func TestSerialize(t *testing.T) {
 }
 
 func TestVmaType(t *testing.T) {
-	target, rs, iters := initTest(t)
+	target, rs, iters := initRandomTargetTest(t, "test", "64")
 	meta := target.SyscallMap["syz_test$vma0"]
 	r := newRand(target, rs)
 	pageSize := target.PageSize
@@ -86,15 +93,120 @@ func TestVmaType(t *testing.T) {
 			if !ok {
 				t.Fatalf("len has bad type: %v", l)
 			}
-			if va.PagesNum < min || va.PagesNum > max {
-				t.Fatalf("vma has bad number of pages: %v, want [%v-%v]", va.PagesNum, min, max)
+			if va.VmaSize < min || va.VmaSize > max {
+				t.Fatalf("vma has bad size: %v, want [%v-%v]",
+					va.VmaSize, min, max)
 			}
-			if la.Val/pageSize < min || la.Val/pageSize > max {
-				t.Fatalf("len has bad number of pages: %v, want [%v-%v]", la.Val/pageSize, min, max)
+			if la.Val < min || la.Val > max {
+				t.Fatalf("len has bad value: %v, want [%v-%v]",
+					la.Val, min, max)
 			}
 		}
-		check(c.Args[0], c.Args[1], 1, 1e5)
-		check(c.Args[2], c.Args[3], 5, 5)
-		check(c.Args[4], c.Args[5], 7, 9)
+		check(c.Args[0], c.Args[1], 1*pageSize, 1e5*pageSize)
+		check(c.Args[2], c.Args[3], 5*pageSize, 5*pageSize)
+		check(c.Args[4], c.Args[5], 7*pageSize, 9*pageSize)
 	}
+}
+
+// TestCrossTarget ensures that a program serialized for one arch can be
+// deserialized for another arch. This happens when managers exchange
+// programs via hub.
+func TestCrossTarget(t *testing.T) {
+	t.Parallel()
+	const OS = "linux"
+	var archs []string
+	for _, target := range AllTargets() {
+		if target.OS == OS {
+			archs = append(archs, target.Arch)
+		}
+	}
+	for _, arch := range archs {
+		target, err := GetTarget(OS, arch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var crossTargets []*Target
+		for _, crossArch := range archs {
+			if crossArch == arch {
+				continue
+			}
+			crossTarget, err := GetTarget(OS, crossArch)
+			if err != nil {
+				t.Fatal(err)
+			}
+			crossTargets = append(crossTargets, crossTarget)
+		}
+		t.Run(fmt.Sprintf("%v/%v", OS, arch), func(t *testing.T) {
+			t.Parallel()
+			testCrossTarget(t, target, crossTargets)
+		})
+	}
+}
+
+func testCrossTarget(t *testing.T, target *Target, crossTargets []*Target) {
+	seed := int64(time.Now().UnixNano())
+	t.Logf("seed=%v", seed)
+	rs := rand.NewSource(seed)
+	iters := 100
+	if testing.Short() {
+		iters /= 10
+	}
+	for i := 0; i < iters; i++ {
+		p := target.Generate(rs, 20, nil)
+		testCrossArchProg(t, p, crossTargets)
+		p, err := target.Deserialize(p.Serialize())
+		if err != nil {
+			t.Fatal(err)
+		}
+		testCrossArchProg(t, p, crossTargets)
+		p.Mutate(rs, 20, nil, nil)
+		testCrossArchProg(t, p, crossTargets)
+		p, _ = Minimize(p, -1, false, func(*Prog, int) bool {
+			return rs.Int63()%2 == 0
+		})
+		testCrossArchProg(t, p, crossTargets)
+	}
+}
+
+func testCrossArchProg(t *testing.T, p *Prog, crossTargets []*Target) {
+	serialized := p.Serialize()
+	for _, crossTarget := range crossTargets {
+		_, err := crossTarget.Deserialize(serialized)
+		if err == nil || strings.Contains(err.Error(), "unknown syscall") {
+			continue
+		}
+		t.Fatalf("failed to deserialize for %v/%v: %v\n%s",
+			crossTarget.OS, crossTarget.Arch, err, serialized)
+	}
+}
+
+func TestSpecialStructs(t *testing.T) {
+	testEachTargetRandom(t, func(t *testing.T, target *Target, rs rand.Source, iters int) {
+		for special, gen := range target.SpecialTypes {
+			t.Run(special, func(t *testing.T) {
+				var typ Type
+				for i := 0; i < len(target.Syscalls) && typ == nil; i++ {
+					ForeachType(target.Syscalls[i], func(t Type) {
+						if t.Dir() == DirOut {
+							return
+						}
+						if s, ok := t.(*StructType); ok && s.Name() == special {
+							typ = s
+						}
+						if s, ok := t.(*UnionType); ok && s.Name() == special {
+							typ = s
+						}
+					})
+				}
+				if typ == nil {
+					t.Fatal("can't find struct description")
+				}
+				g := &Gen{newRand(target, rs), newState(target, nil)}
+				for i := 0; i < iters/len(target.SpecialTypes); i++ {
+					arg, _ := gen(g, typ, nil)
+					gen(g, typ, arg)
+				}
+			})
+		}
+	})
 }

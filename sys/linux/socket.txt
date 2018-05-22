@@ -1,8 +1,6 @@
 # Copyright 2017 syzkaller project authors. All rights reserved.
 # Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
 
-# TODO: due to autobind a socket can bind to port 0, that will result in a random port which is not reproducible
-
 include <asm/ioctls.h>
 include <linux/if_tun.h>
 include <linux/if_bridge.h>
@@ -15,6 +13,7 @@ include <uapi/linux/ethtool.h>
 include <uapi/linux/if_ether.h>
 
 resource sock[fd]
+type sock_port int16be[20000:20004]
 
 # TODO: describe socketcall syscall
 
@@ -44,52 +43,30 @@ socket_domain = AF_UNIX, AF_INET, AF_INET6, AF_IPX, AF_NETLINK, AF_X25, AF_AX25,
 socket_type = SOCK_STREAM, SOCK_DGRAM, SOCK_RAW, SOCK_RDM, SOCK_SEQPACKET, SOCK_DCCP, SOCK_PACKET, SOCK_NONBLOCK, SOCK_CLOEXEC
 accept_flags = SOCK_NONBLOCK, SOCK_CLOEXEC
 shutdown_flags = SHUT_RD, SHUT_WR
-send_flags = MSG_CONFIRM, MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PROBE, MSG_BATCH, MSG_FASTOPEN
+send_flags = MSG_CONFIRM, MSG_DONTROUTE, MSG_DONTWAIT, MSG_EOR, MSG_MORE, MSG_NOSIGNAL, MSG_OOB, MSG_PROBE, MSG_BATCH, MSG_FASTOPEN, MSG_ZEROCOPY
 recv_flags = MSG_CMSG_CLOEXEC, MSG_DONTWAIT, MSG_ERRQUEUE, MSG_OOB, MSG_PEEK, MSG_TRUNC, MSG_WAITALL, MSG_WAITFORONE
 cmsg_levels = SOL_SOCKET, IPPROTO_ICMP, SOL_IP, SOL_TCP, SOL_UDP, SOL_IPV6, SOL_ICMPV6, SOL_SCTP, SOL_UDPLITE, SOL_RAW, SOL_IPX, SOL_AX25, SOL_ATALK, SOL_NETROM, SOL_ROSE, SOL_DECNET, SOL_PACKET, SOL_ATM, SOL_AAL, SOL_IRDA, SOL_NETBEUI, SOL_LLC, SOL_DCCP, SOL_NETLINK, SOL_TIPC, SOL_RXRPC, SOL_PPPOL2TP, SOL_BLUETOOTH, SOL_PNPIPE, SOL_RDS, SOL_IUCV, SOL_CAIF, SOL_ALG, SOL_NFC, SOL_KCM
 
 # This sockaddr type corresponds to the struct sockaddr and is 16 bytes or less.
+# TODO: add AF_APPLETALK, AF_ATMPVC, AF_X25, AF_ROSE, AF_DECnet, AF_ATMSVC, AF_IRDA, AF_IB, AF_TIPC, AF_IUCV, AF_RXRPC, AF_ISDN, AF_PHONET, AF_IEEE802154, AF_CAIF, AF_QIPCRTR
+# Note: AF_UNIX, AF_INET6, AF_PACKET, AF_ALG, AF_PPPOX sockaddr is bigger than 16 bytes
+# Note: AF_NETROM sockaddr is the same as AF_AX25
 sockaddr [
-# AF_UNIX sockaddr in bigger than 16 bytes
 	in		sockaddr_in
 	ax25		sockaddr_ax25
 	ipx		sockaddr_ipx
-# TODO: AF_APPLETALK
-# AF_NETROM sockaddr is the same as AF_AX25
-# TODO: AF_BRIDGE
-# TODO: AF_ATMPVC
-# TODO: AF_X25
-# AF_INET6 sockaddr is bigger than 16 bytes
-# TODO: AF_ROSE
-# TODO: AF_DECnet
 	nl		sockaddr_nl
-# AF_PACKET sockaddr is bigger than 16 bytes
-# TODO: AF_ATMSVC
-# TODO: AF_RDS
-# TODO: AF_IRDA
-# TODO: AF_PPPOX
 	llc		sockaddr_llc
-# TODO: AF_IB
-# TODO: AF_MPLS
-# TODO: AF_CAN
-# TODO: AF_TIPC
+	can		sockaddr_can
 	sco		sockaddr_sco
 	l2		sockaddr_l2
 	hci		sockaddr_hci
 	rc		sockaddr_rc
-# TODO: AF_IUCV
-# TODO: AF_RXRPC
-# TODO: AF_ISDN
-# TODO: AF_PHONET
-# TODO: AF_IEEE802154
-# TODO: AF_CAIF
-# AF_ALG sockaddr is bigger than 16 bytes
 	nfc		sockaddr_nfc
-# TODO: AF_VSOCK
-# TODO: AF_QIPCRTR
+	vsock		sockaddr_vm
 	ethernet	sockaddr_ethernet
 	generic		sockaddr_generic
-]
+] [size[SOCKADDR_SIZE]]
 
 # This sockaddr type corresponds to the sockaddr_storage type and is 128 bytes size.
 sockaddr_storage [
@@ -97,43 +74,31 @@ sockaddr_storage [
 	in		sockaddr_in
 	ax25		sockaddr_ax25
 	ipx		sockaddr_ipx
-# TODO: AF_APPLETALK
-# AF_NETROM sockaddr is the same as AF_AX25
-# TODO: AF_BRIDGE
-# TODO: AF_ATMPVC
-# TODO: AF_X25
 	in6		sockaddr_in6
-# TODO: AF_ROSE
-# TODO: AF_DECnet
 	nl		sockaddr_nl
 	ll		sockaddr_ll
-# TODO: AF_ATMSVC
-# TODO: AF_RDS
-# TODO: AF_IRDA
-# TODO: AF_PPPOX
+	pppoe		sockaddr_pppoe
+	pppol2tp	sockaddr_pppol2tp
+	pppol2tpin6	sockaddr_pppol2tpin6
+	pppol2tpv3	sockaddr_pppol2tpv3
+	pppol2tpv3in6	sockaddr_pppol2tpv3in6
+	pptp		sockaddr_pptp
 	llc		sockaddr_llc
-# TODO: AF_IB
-# TODO: AF_MPLS
-# TODO: AF_CAN
-# TODO: AF_TIPC
+	can		sockaddr_can
 	sco		sockaddr_sco
 	l2		sockaddr_l2
 	hci		sockaddr_hci
 	rc		sockaddr_rc
-# TODO: AF_IUCV
-# TODO: AF_RXRPC
-# TODO: AF_ISDN
-# TODO: AF_PHONET
-# TODO: AF_IEEE802154
-# TODO: AF_CAIF
 	alg		sockaddr_alg
 	nfc		sockaddr_nfc
 	nfc_llcp	sockaddr_nfc_llcp
-# TODO: AF_VSOCK
-# TODO: AF_QIPCRTR
+	vsock		sockaddr_vm
 	ethernet	sockaddr_ethernet
 	generic		sockaddr_storage_generic
-] [varlen]
+] [size[SOCKADDR_STORAGE_SIZE]]
+
+define SOCKADDR_SIZE	sizeof(struct sockaddr)
+define SOCKADDR_STORAGE_SIZE	sizeof(struct sockaddr_storage)
 
 sockaddr_generic {
 	sa_family	flags[socket_domain, int16]
@@ -150,8 +115,8 @@ send_msghdr {
 	msg_namelen	len[msg_name, int32]
 	msg_iov		ptr[in, array[iovec_in]]
 	msg_iovlen	len[msg_iov, intptr]
-	msg_control	ptr[in, array[cmsghdr]]
-	msg_controllen	len[msg_control, intptr]
+	msg_control	ptr[in, array[cmsghdr], opt]
+	msg_controllen	bytesize[msg_control, intptr]
 	msg_flags	flags[send_flags, int32]
 }
 
@@ -165,8 +130,8 @@ recv_msghdr {
 	msg_namelen	len[msg_name, int32]
 	msg_iov		ptr[in, array[iovec_out]]
 	msg_iovlen	len[msg_iov, intptr]
-	msg_control	buffer[out]
-	msg_controllen	len[msg_control, intptr]
+	msg_control	ptr[out, array[int8], opt]
+	msg_controllen	bytesize[msg_control, intptr]
 	msg_flags	int32
 }
 
@@ -189,7 +154,6 @@ cmsghdr {
 setsockopt$sock_void(fd sock, level const[SOL_SOCKET], optname flags[sockopt_opt_sock_void], optval const[0], optlen const[0])
 getsockopt$sock_int(fd sock, level const[SOL_SOCKET], optname flags[sockopt_opt_sock_int], optval ptr[out, int32], optlen ptr[inout, len[optval, int32]])
 setsockopt$sock_int(fd sock, level const[SOL_SOCKET], optname flags[sockopt_opt_sock_int], optval ptr[in, int32], optlen len[optval])
-setsockopt$sock_str(fd sock, level const[SOL_SOCKET], optname const[SO_BINDTODEVICE], optval ptr[in, string], optlen len[optval])
 getsockopt$sock_linger(fd sock, level const[SOL_SOCKET], optname const[SO_LINGER], optval ptr[out, linger], optlen ptr[inout, len[optval, int32]])
 setsockopt$sock_linger(fd sock, level const[SOL_SOCKET], optname const[SO_LINGER], optval ptr[in, linger], optlen len[optval])
 getsockopt$sock_cred(fd sock, level const[SOL_SOCKET], optname const[SO_PEERCRED], optval ptr[out, ucred], optlen ptr[inout, len[optval, int32]])
@@ -202,13 +166,18 @@ getsockopt$SO_TIMESTAMPING(fd sock, level const[SOL_SOCKET], optname const[SO_TI
 setsockopt$SO_ATTACH_FILTER(fd sock, level const[SOL_SOCKET], optname const[SO_ATTACH_FILTER], optval ptr[in, sock_fprog], optlen len[optval])
 setsockopt$SO_BINDTODEVICE(fd sock, level const[SOL_SOCKET], optname const[SO_BINDTODEVICE], optval ptr[in, devname], optlen len[optval])
 getsockopt$SO_BINDTODEVICE(fd sock, level const[SOL_SOCKET], optname const[SO_BINDTODEVICE], optval ptr[out, devname], optlen len[optval])
-getsockopt$SO_PEERCRED(fd sock, level const[SOL_SOCKET], optname const[SO_PEERCRED], optval ptr[out, ucred], optlen len[optval])
 getsockopt$sock_buf(fd sock, level const[SOL_SOCKET], optname flags[sockopt_opt_sock_buf], optval buffer[out], optlen ptr[inout, len[optval, int32]])
+getsockopt$SO_COOKIE(fd sock, level const[SOL_SOCKET], optname const[SO_COOKIE], optval ptr[out, int64], optlen ptr[inout, len[optval, int32]])
+
+linger {
+	onoff	bool32
+	linger	int32
+}
 
 sockopt_opt_sock_void = SO_DETACH_FILTER, SO_MARK
-sockopt_opt_sock_int = SO_ACCEPTCONN, SO_BROADCAST, SO_DEBUG, SO_DOMAIN, SO_ERROR, SO_DONTROUTE, SO_KEEPALIVE, SO_PEEK_OFF, SO_PRIORITY, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_RCVLOWAT, SO_SNDLOWAT, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TIMESTAMP, SO_TYPE, SO_REUSEPORT, SO_OOBINLINE, SO_NO_CHECK, SO_PASSCRED, SO_TIMESTAMPNS, SO_LOCK_FILTER, SO_PASSSEC, SO_RXQ_OVFL, SO_WIFI_STATUS, SO_NOFCS, SO_SELECT_ERR_QUEUE, SO_BUSY_POLL, SO_MAX_PACING_RATE
+sockopt_opt_sock_int = SO_ACCEPTCONN, SO_BROADCAST, SO_DEBUG, SO_DOMAIN, SO_ERROR, SO_DONTROUTE, SO_KEEPALIVE, SO_PEEK_OFF, SO_PRIORITY, SO_PROTOCOL, SO_RCVBUF, SO_RCVBUFFORCE, SO_RCVLOWAT, SO_SNDLOWAT, SO_REUSEADDR, SO_SNDBUF, SO_SNDBUFFORCE, SO_TIMESTAMP, SO_TYPE, SO_REUSEPORT, SO_OOBINLINE, SO_NO_CHECK, SO_PASSCRED, SO_TIMESTAMPNS, SO_LOCK_FILTER, SO_PASSSEC, SO_RXQ_OVFL, SO_WIFI_STATUS, SO_NOFCS, SO_SELECT_ERR_QUEUE, SO_BUSY_POLL, SO_MAX_PACING_RATE, SO_ZEROCOPY
 sockopt_opt_sock_timeval = SO_RCVTIMEO, SO_SNDTIMEO
-sockopt_opt_sock_buf = SO_PEERNAME, SO_PEERSEC, SO_GET_FILTER
+sockopt_opt_sock_buf = SO_PEERNAME, SO_PEERSEC, SO_GET_FILTER, SO_MEMINFO, SO_PEERGROUPS
 sockopt_so_timestamping = SOF_TIMESTAMPING_TX_HARDWARE, SOF_TIMESTAMPING_TX_SOFTWARE, SOF_TIMESTAMPING_RX_HARDWARE, SOF_TIMESTAMPING_RX_SOFTWARE, SOF_TIMESTAMPING_SOFTWARE, SOF_TIMESTAMPING_SYS_HARDWARE, SOF_TIMESTAMPING_RAW_HARDWARE, SOF_TIMESTAMPING_OPT_ID, SOF_TIMESTAMPING_TX_SCHED, SOF_TIMESTAMPING_TX_ACK, SOF_TIMESTAMPING_OPT_CMSG, SOF_TIMESTAMPING_OPT_TSONLY
 
 # Socket ioctls
@@ -219,13 +188,9 @@ sockopt_so_timestamping = SOF_TIMESTAMPING_TX_HARDWARE, SOF_TIMESTAMPING_TX_SOFT
 
 # http://lxr.free-electrons.com/source/include/uapi/asm-generic/sockios.h
 
-# TODO: SIOCADDRT, SIOCDELRT, SIOCRTMSG
+# TODO: add SIOCADDRT, SIOCDELRT, SIOCRTMSG, SIOCDRARP, SIOCGRARP, SIOCSRARP, SIOCGIFVLAN, SIOCSIFVLAN, SIOCGSTAMP, SIOCGSTAMPNS
 
-ioctl$sock_SIOCETHTOOL(fd sock, cmd const[SIOCETHTOOL], arg ptr[inout, ifreq_SIOCETHTOOL])
-
-# TODO: SIOCDRARP, SIOCGRARP, SIOCSRARP
-# TODO: SIOCGIFVLAN, SIOCSIFVLAN
-# TODO: SIOCGSTAMP, SIOCGSTAMPNS
+ioctl$sock_SIOCETHTOOL(fd sock, cmd const[SIOCETHTOOL], arg ptr[inout, ifreq_t[ptr[inout, ethtool_cmd_u]]])
 
 ioctl$sock_SIOCOUTQ(fd sock, cmd const[SIOCOUTQ], arg ptr[out, int32])
 ioctl$sock_SIOCINQ(fd sock, cmd const[SIOCINQ], arg ptr[out, int32])
@@ -236,10 +201,10 @@ ifreq_ioctls = SIOCGIFNAME, SIOCSIFLINK, SIOCGIFFLAGS, SIOCSIFFLAGS, SIOCGIFADDR
 
 ioctl$sock_ifreq(fd sock, cmd flags[ifreq_ioctls], arg ptr[inout, ifreq])
 
-ioctl$sock_SIOCGIFINDEX(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_SIOCGIFINDEX])
+ioctl$sock_SIOCGIFINDEX(fd sock, cmd const[SIOCGIFINDEX], arg ptr[inout, ifreq_t[ifindex]])
 
 ioctl$sock_SIOCGIFBR(fd sock, cmd const[SIOCGIFBR], arg ptr[inout, brctl_arg])
-ioctl$sock_SIOCSIFBR(fd sock, cmd const[SIOCGIFBR], arg ptr[inout, brctl_arg])
+ioctl$sock_SIOCSIFBR(fd sock, cmd const[SIOCSIFBR], arg ptr[inout, brctl_arg])
 
 ioctl$sock_SIOCOUTQNSD(fd sock, cmd const[SIOCOUTQNSD], arg ptr[out, int32])
 
@@ -268,42 +233,18 @@ ioctl$sock_SIOCGPGRP(fd sock, cmd const[SIOCGPGRP], arg ptr[out, pid])
 
 resource ifindex[int32]
 
-ifreq_SIOCGIFINDEX {
-	ifr_ifrn	devname
-	ifr_ifru	ifindex
-	pad		array[const[0, int8], 20]
-} [packed]
+type ifreq_dev_t[DEVNAME, ELEM] {
+	ifr_ifrn	string[DEVNAME, IFNAMSIZ]
+	elem		ELEM
+} [size[IFREQ_SIZE]]
 
-ifreq_SIOCETHTOOL {
-	ifr_ifrn	devname
-	ifr_ifru	ptr[inout, ethtool_cmd_u]
-	pad		array[const[0, int8], 16]
-} [packed]
+type ifreq_t[ELEM] ifreq_dev_t[devnames, ELEM]
 
-ifreq {
-	ifr_ifrn	devname
-	ifr_ifru	ifr_ifru
-}
-
-syzn_devname {
-	s	const[115, int8]
-	y	const[121, int8]
-	z	const[122, int8]
-	N	proc[48, 1, int8]
-	z0	const[0, int8]
-}
-
-# We could add "eth0" to this list as well, but this will affect the connection between fuzzer and manager and produce lots of "no output" crashes.
-devnames = "lo", "tunl0", "gre0", "gretap0", "ip_vti0", "ip6_vti0", "sit0", "ip6tnl0", "ip6gre0", "bond0", "dummy0", "eql", "ifb0", "ipddp0", "yam0", "bcsf0", "bcsh0", "teql0", "nr0", "rose0", "irlan0", "bpq0"
-
-devname [
-	generic	array[int8, IFNAMSIZ]
-	common	string[devnames, IFNAMSIZ]
-	syzn	syzn_devname
-]
+type ifreq ifreq_t[ifr_ifru]
 
 ifr_ifru [
 	ifru_addrs	sockaddr
+	ifru_hwaddr	mac_addr
 	ifru_flags	flags[ifru_flags, int16]
 	ifru_ivalue	int32
 	ifru_mtu	int32
@@ -313,11 +254,27 @@ ifr_ifru [
 	ifru_settings	if_settings
 ]
 
+define IFREQ_SIZE	sizeof(struct ifreq)
+
+# We could add "eth0" to this list as well, but this will affect the connection
+# between fuzzer and manager and produce lots of "no output" crashes
+# (actually, this is not true now since all testing is done in a separate
+# network namespace, but we still don't mess with eth0).
+devnames = "", "lo", "tunl0", "gre0", "gretap0", "ip_vti0", "ip6_vti0", "sit0", "ip6tnl0", "ip6gre0", "ip6gretap0", "bond0", "dummy0", "eql", "ifb0", "ipddp0", "yam0", "bcsf0", "bcsh0", "teql0", "nr0", "rose0", "irlan0", "erspan0", "bpq0", "vlan0", "bridge0", "vcan0", "team0", "syz_tun", "veth0", "veth1", "veth0_to_bridge", "veth1_to_bridge", "veth0_to_bond", "veth1_to_bond", "veth0_to_team", "veth1_to_team", "bridge_slave_0", "bridge_slave_1", "bond_slave_0", "bond_slave_1", "team_slave_0", "team_slave_1", "syzkaller0", "syzkaller1"
+
+type devname string[devnames, IFNAMSIZ]
+
+devname_mask {
+	lo	flags[devname_mask_values, int8]
+} [size[IFNAMSIZ]]
+
+devname_mask_values = 0, 0xff
+
 ifru_flags = IFF_TUN, IFF_TAP, IFF_NO_PI, IFF_ONE_QUEUE, IFF_VNET_HDR, IFF_TUN_EXCL, IFF_MULTI_QUEUE, IFF_ATTACH_QUEUE, IFF_DETACH_QUEUE, IFF_PERSIST, IFF_NOFILTER
 
 ifmap {
-	mem_start	int64
-	mem_end		int64
+	mem_start	intptr
+	mem_end		intptr
 	base_addr	int16
 	irq		int8
 	dma		int8
@@ -696,8 +653,8 @@ ethtool_flow_ext {
 ethtool_tcpip4_spec {
 	ip4src	ipv4_addr
 	ip4dst	ipv4_addr
-	psrc	proc[20000, 4, int16be]
-	pdst	proc[20000, 4, int16be]
+	psrc	sock_port
+	pdst	sock_port
 	tos	int8
 }
 
@@ -720,8 +677,8 @@ ethtool_usrip4_spec {
 ethtool_tcpip6_spec {
 	ip6src	ipv6_addr
 	ip6dst	ipv6_addr
-	psrc	proc[20000, 4, int16be]
-	pdst	proc[20000, 4, int16be]
+	psrc	sock_port
+	pdst	sock_port
 	tclass	int8
 }
 

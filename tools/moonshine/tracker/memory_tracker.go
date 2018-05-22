@@ -6,6 +6,10 @@ import (
 
 )
 
+const (
+	memAllocMaxMem  = 16 << 20
+)
+
 type Allocation struct {
 	num_bytes uint64
 	arg Arg
@@ -188,26 +192,16 @@ func (m *MemoryTracker) FillOutMemory(prog *Prog) error {
 	offset := uint64(0)
 
 	for _, call := range prog.Calls {
-		pages := uint64(0)
 		if _, ok := m.allocations[call]; !ok {
 			continue
 		}
 		for _, a := range m.allocations[call] {
 			switch arg := a.arg.(type) {
 			case *PointerArg:
-				switch arg.Type().(type) {
-				case *VmaType:
-					pages = a.num_bytes % PageSize + 1
-				default:
-					pages = 0
-				}
-				arg.PageIndex = uint64(offset/PageSize)
-				arg.PageOffset = int(offset % PageSize)
-				arg.PagesNum = pages
+				arg.Address = offset + a.num_bytes
 				offset += a.num_bytes
-				if uint64(arg.PageIndex) + uint64(arg.PagesNum) >= uint64(4096) {
-					return fmt.Errorf("Call: %v, address out of range: %d %d %d\n",
-						call, arg.PageIndex, arg.PagesNum, offset)
+				if arg.Address >= memAllocMaxMem {
+					return fmt.Errorf("Call: %v, address out of range: %d\n", arg.Address)
 				}
 			default:
 				panic("Pointer Arg Failed")
@@ -215,7 +209,9 @@ func (m *MemoryTracker) FillOutMemory(prog *Prog) error {
 		}
 	}
 
-	offset = ((offset/PageSize) + 1)*PageSize
+	if offset % PageSize > 0 {
+		offset = (offset/PageSize+1)*PageSize
+	}
 	for _, mapping := range m.mappings {
 		for _, dep := range mapping.usedBy {
 			switch arg_ := dep.arg.(type) {
@@ -225,14 +221,12 @@ func (m *MemoryTracker) FillOutMemory(prog *Prog) error {
 					numPages = 1
 				}
 				//Offset should align with the start of a mapping/end of previous mapping.
-				arg_.PageIndex = uint64((offset + dep.start - mapping.start)/PageSize)+1  //dep.start - mapping.start should be 0 for mmaps
-				arg_.PageOffset = 0
-				arg_.PagesNum = numPages
-				arg_.Size()
+				arg_.Address = offset + dep.start - mapping.start
+
 				arg_.Res = nil
-				if uint64(arg_.PageIndex) + uint64(arg_.PagesNum) >= uint64(4096) {
-					return fmt.Errorf("Address out of range: %d %d %d\n",
-						arg_.PageIndex, arg_.PagesNum, offset)
+				if arg_.Address >= memAllocMaxMem || arg_.Address+arg_.VmaSize > memAllocMaxMem{
+					return fmt.Errorf("Address out of range: %d\n",
+						arg_.Address)
 				}
 			default:
 				panic("Mapping needs to be Pointer Arg")
@@ -253,8 +247,11 @@ func (m *MemoryTracker) GetTotalMemoryAllocations(prog *Prog) uint64{
 			sum += a.num_bytes
 		}
 	}
-
-	fmt.Printf("Total Memory: %d\n", sum)
+	fmt.Printf("SUM: %d\n", sum)
+	if sum % PageSize > 0 {
+		sum = (sum/PageSize+1)*PageSize
+	}
+	fmt.Printf("Total Memory Allocations: %d\n", sum)
 	return sum
 }
 

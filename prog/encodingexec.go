@@ -4,6 +4,19 @@
 // This file does serialization of programs for executor binary.
 // The format aims at simple parsing: binary and irreversible.
 
+// Exec format is an sequence of uint64's which encodes a sequence of calls.
+// The sequence is terminated by a speciall call execInstrEOF.
+// Each call is (call ID, copyout index, number of arguments, arguments...).
+// Each argument is (type, size, value).
+// There are 4 types of arguments:
+//  - execArgConst: value is const value
+//  - execArgResult: value is copyout index we want to reference
+//  - execArgData: value is a binary blob (represented as ]size/8[ uint64's)
+//  - execArgCsum: runtime checksum calculation
+// There are 2 other special calls:
+//  - execInstrCopyin: copies its second argument into address specified by first argument
+//  - execInstrCopyout: reads value at address specified by first argument (result can be referenced by execArgResult)
+
 package prog
 
 import (
@@ -12,16 +25,16 @@ import (
 )
 
 const (
-	ExecInstrEOF = ^uint64(iota)
-	ExecInstrCopyin
-	ExecInstrCopyout
+	execInstrEOF = ^uint64(iota)
+	execInstrCopyin
+	execInstrCopyout
 )
 
 const (
-	ExecArgConst = uint64(iota)
-	ExecArgResult
-	ExecArgData
-	ExecArgCsum
+	execArgConst = uint64(iota)
+	execArgResult
+	execArgData
+	execArgCsum
 )
 
 const (
@@ -35,36 +48,19 @@ const (
 
 const (
 	ExecBufferSize = 2 << 20
+	ExecNoCopyout  = ^uint64(0)
 )
 
-type Args []Arg
-
-func (s Args) Len() int {
-	return len(s)
-}
-
-func (s Args) Swap(i, j int) {
-	s[i], s[j] = s[j], s[i]
-}
-
-type ByPhysicalAddr struct {
-	Args
-	Context *execContext
-}
-
-func (s ByPhysicalAddr) Less(i, j int) bool {
-	return s.Context.args[s.Args[i]].Addr < s.Context.args[s.Args[j]].Addr
-}
-
 // SerializeForExec serializes program p for execution by process pid into the provided buffer.
+// Returns number of bytes written to the buffer.
 // If the provided buffer is too small for the program an error is returned.
-func (p *Prog) SerializeForExec(buffer []byte, pid int) error {
+func (p *Prog) SerializeForExec(buffer []byte) (int, error) {
 	if debug {
 		if err := p.validate(); err != nil {
 			panic(fmt.Errorf("serializing invalid program: %v", err))
 		}
 	}
-	instrSeq := 0
+	var copyoutSeq uint64
 	w := &execContext{
 		target: p.Target,
 		buf:    buffer,
@@ -73,7 +69,7 @@ func (p *Prog) SerializeForExec(buffer []byte, pid int) error {
 	}
 	for _, c := range p.Calls {
 		// Calculate checksums.
-		csumMap := calcChecksumsCall(c, pid)
+		csumMap := calcChecksumsCall(c)
 		var csumUses map[Arg]bool
 		if csumMap != nil {
 			csumUses = make(map[Arg]bool)
@@ -90,30 +86,27 @@ func (p *Prog) SerializeForExec(buffer []byte, pid int) error {
 		}
 		// Calculate arg offsets within structs.
 		// Generate copyin instructions that fill in data into pointer arguments.
-		foreachArg(c, func(arg, _ Arg, _ *[]Arg) {
-			if a, ok := arg.(*PointerArg); ok && a.Res != nil {
-				foreachSubargOffset(a.Res, func(arg1 Arg, offset uint64) {
-					used, ok := arg1.(ArgUsed)
-					if (ok && len(*used.Used()) != 0) || csumUses[arg1] {
-						w.args[arg1] = argInfo{Addr: p.Target.physicalAddr(arg) + offset}
-					}
-					if _, ok := arg1.(*GroupArg); ok {
-						return
-					}
-					if _, ok := arg1.(*UnionArg); ok {
-						return
-					}
-					if a1, ok := arg1.(*DataArg); ok && len(a1.Data) == 0 {
-						return
-					}
-					if !IsPad(arg1.Type()) && arg1.Type().Dir() != DirOut {
-						w.write(ExecInstrCopyin)
-						w.write(p.Target.physicalAddr(arg) + offset)
-						w.writeArg(arg1, pid, csumMap)
-						instrSeq++
-					}
-				})
+		ForeachArg(c, func(arg Arg, ctx *ArgCtx) {
+			if ctx.Base == nil {
+				return
 			}
+			addr := p.Target.PhysicalAddr(ctx.Base) + ctx.Offset
+			if res, ok := arg.(*ResultArg); ok && len(res.uses) != 0 || csumUses[arg] {
+				w.args[arg] = argInfo{Addr: addr}
+			}
+			if _, ok := arg.(*GroupArg); ok {
+				return
+			}
+			if _, ok := arg.(*UnionArg); ok {
+				return
+			}
+			typ := arg.Type()
+			if typ.Dir() == DirOut || IsPad(typ) || arg.Size() == 0 {
+				return
+			}
+			w.write(execInstrCopyin)
+			w.write(addr)
+			w.writeArg(arg)
 		})
 		// Generate checksum calculation instructions starting from the last one,
 		// since checksum values can depend on values of the latter ones
@@ -122,15 +115,17 @@ func (p *Prog) SerializeForExec(buffer []byte, pid int) error {
 			for arg := range csumMap {
 				csumArgs = append(csumArgs, arg)
 			}
-			sort.Sort(ByPhysicalAddr{Args: csumArgs, Context: w})
+			sort.Slice(csumArgs, func(i, j int) bool {
+				return w.args[csumArgs[i]].Addr < w.args[csumArgs[j]].Addr
+			})
 			for i := len(csumArgs) - 1; i >= 0; i-- {
 				arg := csumArgs[i]
 				if _, ok := arg.Type().(*CsumType); !ok {
 					panic("csum arg is not csum type")
 				}
-				w.write(ExecInstrCopyin)
+				w.write(execInstrCopyin)
 				w.write(w.args[arg].Addr)
-				w.write(ExecArgCsum)
+				w.write(execArgCsum)
 				w.write(arg.Size())
 				switch csumMap[arg].Kind {
 				case CsumInet:
@@ -153,66 +148,54 @@ func (p *Prog) SerializeForExec(buffer []byte, pid int) error {
 				default:
 					panic(fmt.Sprintf("csum arg has unknown kind %v", csumMap[arg].Kind))
 				}
-				instrSeq++
 			}
 		}
 		// Generate the call itself.
 		w.write(uint64(c.Meta.ID))
+		if c.Ret != nil && len(c.Ret.uses) != 0 {
+			if _, ok := w.args[c.Ret]; ok {
+				panic("argInfo is already created for return value")
+			}
+			w.args[c.Ret] = argInfo{Idx: copyoutSeq, Ret: true}
+			w.write(copyoutSeq)
+			copyoutSeq++
+		} else {
+			w.write(ExecNoCopyout)
+		}
 		w.write(uint64(len(c.Args)))
 		for _, arg := range c.Args {
-			w.writeArg(arg, pid, csumMap)
+			w.writeArg(arg)
 		}
-		if len(*c.Ret.(ArgUsed).Used()) != 0 {
-			w.args[c.Ret] = argInfo{Idx: instrSeq}
-		}
-		instrSeq++
 		// Generate copyout instructions that persist interesting return values.
-		foreachArg(c, func(arg, base Arg, _ *[]Arg) {
-			if used, ok := arg.(ArgUsed); !ok || len(*used.Used()) == 0 {
-				return
-			}
-			switch arg.(type) {
-			case *ReturnArg:
-				// Idx is already assigned above.
-			case *ConstArg, *ResultArg:
+		ForeachArg(c, func(arg Arg, _ *ArgCtx) {
+			if res, ok := arg.(*ResultArg); ok && len(res.uses) != 0 {
 				// Create a separate copyout instruction that has own Idx.
-				if _, ok := base.(*PointerArg); !ok {
-					panic("arg base is not a pointer")
-				}
 				info := w.args[arg]
-				info.Idx = instrSeq
-				instrSeq++
+				if info.Ret {
+					return // Idx is already assigned above.
+				}
+				info.Idx = copyoutSeq
+				copyoutSeq++
 				w.args[arg] = info
-				w.write(ExecInstrCopyout)
+				w.write(execInstrCopyout)
+				w.write(info.Idx)
 				w.write(info.Addr)
 				w.write(arg.Size())
-			default:
-				fmt.Printf("foreachArg on call: %v\n", c.Meta.CallName)
-				fmt.Printf("arg: %v\n", arg)
-				fmt.Printf("base: %v\n", base)
-				fmt.Println("bad arg kind in copyout")
 			}
 		})
 	}
-	w.write(ExecInstrEOF)
+	w.write(execInstrEOF)
 	if w.eof {
-		return fmt.Errorf("provided buffer is too small")
+		return 0, fmt.Errorf("provided buffer is too small")
 	}
-	return nil
+	return len(buffer) - len(w.buf), nil
 }
 
-func (target *Target) physicalAddr(arg Arg) uint64 {
-	a, ok := arg.(*PointerArg)
-	if !ok {
-		panic("physicalAddr: bad arg kind")
+func (target *Target) PhysicalAddr(arg *PointerArg) uint64 {
+	if arg.IsNull() {
+		return 0
 	}
-	addr := a.PageIndex*target.PageSize + target.DataOffset
-	if a.PageOffset >= 0 {
-		addr += uint64(a.PageOffset)
-	} else {
-		addr += target.PageSize - uint64(-a.PageOffset)
-	}
-	return addr
+	return target.DataOffset + arg.Address
 }
 
 type execContext struct {
@@ -224,7 +207,8 @@ type execContext struct {
 
 type argInfo struct {
 	Addr uint64 // physical addr
-	Idx  int    // instruction index
+	Idx  uint64 // copyout instruction index
+	Ret  bool
 }
 
 func (w *execContext) write(v uint64) {
@@ -243,48 +227,56 @@ func (w *execContext) write(v uint64) {
 	w.buf = w.buf[8:]
 }
 
-func (w *execContext) writeArg(arg Arg, pid int, csumMap map[Arg]CsumInfo) {
+func (w *execContext) writeArg(arg Arg) {
 	switch a := arg.(type) {
 	case *ConstArg:
-		w.write(ExecArgConst)
-		w.write(a.Size())
-		w.write(a.Value(pid))
-		w.write(a.Type().BitfieldOffset())
-		w.write(a.Type().BitfieldLength())
+		val, pidStride, bigEndian := a.Value()
+		w.writeConstArg(a.Size(), val, a.Type().BitfieldOffset(), a.Type().BitfieldLength(),
+			pidStride, bigEndian)
 	case *ResultArg:
 		if a.Res == nil {
-			w.write(ExecArgConst)
-			w.write(a.Size())
-			w.write(a.Val)
-			w.write(0) // bit field offset
-			w.write(0) // bit field length
+			w.writeConstArg(a.Size(), a.Val, 0, 0, 0, false)
 		} else {
-			w.write(ExecArgResult)
+			info, ok := w.args[a.Res]
+			if !ok {
+				panic("no copyout index")
+			}
+			w.write(execArgResult)
 			w.write(a.Size())
-			w.write(uint64(w.args[a.Res].Idx))
+			w.write(info.Idx)
 			w.write(a.OpDiv)
 			w.write(a.OpAdd)
+			w.write(a.Type().(*ResourceType).Default())
 		}
 	case *PointerArg:
-		w.write(ExecArgConst)
-		w.write(a.Size())
-		w.write(w.target.physicalAddr(arg))
-		w.write(0) // bit field offset
-		w.write(0) // bit field length
+		w.writeConstArg(a.Size(), w.target.PhysicalAddr(a), 0, 0, 0, false)
 	case *DataArg:
-		w.write(ExecArgData)
-		w.write(uint64(len(a.Data)))
-		padded := len(a.Data)
-		if pad := 8 - len(a.Data)%8; pad != 8 {
+		data := a.Data()
+		w.write(execArgData)
+		w.write(uint64(len(data)))
+		padded := len(data)
+		if pad := 8 - len(data)%8; pad != 8 {
 			padded += pad
 		}
 		if len(w.buf) < padded {
 			w.eof = true
 		} else {
-			copy(w.buf, a.Data)
+			copy(w.buf, data)
 			w.buf = w.buf[padded:]
 		}
+	case *UnionArg:
+		w.writeArg(a.Option)
 	default:
 		panic("unknown arg type")
 	}
+}
+
+func (w *execContext) writeConstArg(size, val, bfOffset, bfLength, pidStride uint64, bigEndian bool) {
+	w.write(execArgConst)
+	meta := size | bfOffset<<16 | bfLength<<24 | pidStride<<32
+	if bigEndian {
+		meta |= 1 << 8
+	}
+	w.write(meta)
+	w.write(val)
 }

@@ -14,6 +14,7 @@ package gce
 import (
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -30,18 +31,21 @@ type Context struct {
 	ZoneID     string
 	Instance   string
 	InternalIP string
+	ExternalIP string
+	Network    string
+	Subnetwork string
 
 	computeService *compute.Service
 
 	// apiCallTicker ticks regularly, preventing us from accidentally making
-	// GCE API calls too quickly. Our quota is 20 QPS, but we temporarily
-	// limit ourselves to less than that.
+	// GCE API calls too quickly. Our quota is 20 QPS, but we limit ourselves
+	// to less than that because several independent programs can do API calls.
 	apiRateGate <-chan time.Time
 }
 
 func NewContext() (*Context, error) {
 	ctx := &Context{
-		apiRateGate: time.NewTicker(time.Second / 10).C,
+		apiRateGate: time.NewTicker(time.Second).C,
 	}
 	background := context.Background()
 	tokenSource, err := google.DefaultTokenSource(background, compute.CloudPlatformScope)
@@ -73,8 +77,14 @@ func NewContext() (*Context, error) {
 	for _, iface := range inst.NetworkInterfaces {
 		if strings.HasPrefix(iface.NetworkIP, "10.") {
 			ctx.InternalIP = iface.NetworkIP
-			break
 		}
+		for _, ac := range iface.AccessConfigs {
+			if ac.NatIP != "" {
+				ctx.ExternalIP = ac.NatIP
+			}
+		}
+		ctx.Network = iface.Network
+		ctx.Subnetwork = iface.Subnetwork
 	}
 	if ctx.InternalIP == "" {
 		return nil, fmt.Errorf("failed to get current instance internal IP")
@@ -116,7 +126,8 @@ func (ctx *Context) CreateInstance(name, machineType, image, sshkey string) (str
 		},
 		NetworkInterfaces: []*compute.NetworkInterface{
 			&compute.NetworkInterface{
-				Network: "global/networks/default",
+				Network:    ctx.Network,
+				Subnetwork: ctx.Subnetwork,
 			},
 		},
 		Scheduling: &compute.Scheduling{
@@ -127,8 +138,11 @@ func (ctx *Context) CreateInstance(name, machineType, image, sshkey string) (str
 	}
 
 retry:
-	<-ctx.apiRateGate
-	op, err := ctx.computeService.Instances.Insert(ctx.ProjectID, ctx.ZoneID, instance).Do()
+	var op *compute.Operation
+	err := ctx.apiCall(func() (err error) {
+		op, err = ctx.computeService.Instances.Insert(ctx.ProjectID, ctx.ZoneID, instance).Do()
+		return
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create instance: %v", err)
 	}
@@ -140,8 +154,11 @@ retry:
 		return "", err
 	}
 
-	<-ctx.apiRateGate
-	inst, err := ctx.computeService.Instances.Get(ctx.ProjectID, ctx.ZoneID, name).Do()
+	var inst *compute.Instance
+	err = ctx.apiCall(func() (err error) {
+		inst, err = ctx.computeService.Instances.Get(ctx.ProjectID, ctx.ZoneID, name).Do()
+		return
+	})
 	if err != nil {
 		return "", fmt.Errorf("error getting instance %s details after creation: %v", name, err)
 	}
@@ -161,8 +178,11 @@ retry:
 }
 
 func (ctx *Context) DeleteInstance(name string, wait bool) error {
-	<-ctx.apiRateGate
-	op, err := ctx.computeService.Instances.Delete(ctx.ProjectID, ctx.ZoneID, name).Do()
+	var op *compute.Operation
+	err := ctx.apiCall(func() (err error) {
+		op, err = ctx.computeService.Instances.Delete(ctx.ProjectID, ctx.ZoneID, name).Do()
+		return
+	})
 	if apiErr, ok := err.(*googleapi.Error); ok && apiErr.Code == 404 {
 		return nil
 	}
@@ -178,12 +198,15 @@ func (ctx *Context) DeleteInstance(name string, wait bool) error {
 }
 
 func (ctx *Context) IsInstanceRunning(name string) bool {
-	<-ctx.apiRateGate
-	instance, err := ctx.computeService.Instances.Get(ctx.ProjectID, ctx.ZoneID, name).Do()
+	var inst *compute.Instance
+	err := ctx.apiCall(func() (err error) {
+		inst, err = ctx.computeService.Instances.Get(ctx.ProjectID, ctx.ZoneID, name).Do()
+		return
+	})
 	if err != nil {
 		return false
 	}
-	return instance.Status == "RUNNING"
+	return inst.Status == "RUNNING"
 }
 
 func (ctx *Context) CreateImage(imageName, gcsFile string) error {
@@ -196,16 +219,21 @@ func (ctx *Context) CreateImage(imageName, gcsFile string) error {
 			"https://www.googleapis.com/compute/v1/projects/vm-options/global/licenses/enable-vmx",
 		},
 	}
-	<-ctx.apiRateGate
-	op, err := ctx.computeService.Images.Insert(ctx.ProjectID, image).Do()
+	var op *compute.Operation
+	err := ctx.apiCall(func() (err error) {
+		op, err = ctx.computeService.Images.Insert(ctx.ProjectID, image).Do()
+		return
+	})
 	if err != nil {
 		// Try again without the vmx license in case it is not supported.
 		image.Licenses = nil
-		<-ctx.apiRateGate
-		op, err = ctx.computeService.Images.Insert(ctx.ProjectID, image).Do()
-	}
-	if err != nil {
-		return fmt.Errorf("failed to create image: %v", err)
+		err := ctx.apiCall(func() (err error) {
+			op, err = ctx.computeService.Images.Insert(ctx.ProjectID, image).Do()
+			return
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create image: %v", err)
+		}
 	}
 	if err := ctx.waitForCompletion("global", "create image", op.Name, false); err != nil {
 		return err
@@ -214,8 +242,11 @@ func (ctx *Context) CreateImage(imageName, gcsFile string) error {
 }
 
 func (ctx *Context) DeleteImage(imageName string) error {
-	<-ctx.apiRateGate
-	op, err := ctx.computeService.Images.Delete(ctx.ProjectID, imageName).Do()
+	var op *compute.Operation
+	err := ctx.apiCall(func() (err error) {
+		op, err = ctx.computeService.Images.Delete(ctx.ProjectID, imageName).Do()
+		return
+	})
 	if apiErr, ok := err.(*googleapi.Error); ok && apiErr.Code == 404 {
 		return nil
 	}
@@ -237,17 +268,18 @@ func (err resourcePoolExhaustedError) Error() string {
 func (ctx *Context) waitForCompletion(typ, desc, opName string, ignoreNotFound bool) error {
 	for {
 		time.Sleep(2 * time.Second)
-		<-ctx.apiRateGate
-		var err error
 		var op *compute.Operation
-		switch typ {
-		case "global":
-			op, err = ctx.computeService.GlobalOperations.Get(ctx.ProjectID, opName).Do()
-		case "zone":
-			op, err = ctx.computeService.ZoneOperations.Get(ctx.ProjectID, ctx.ZoneID, opName).Do()
-		default:
-			panic("unknown operation type: " + typ)
-		}
+		err := ctx.apiCall(func() (err error) {
+			switch typ {
+			case "global":
+				op, err = ctx.computeService.GlobalOperations.Get(ctx.ProjectID, opName).Do()
+			case "zone":
+				op, err = ctx.computeService.ZoneOperations.Get(ctx.ProjectID, ctx.ZoneID, opName).Do()
+			default:
+				panic("unknown operation type: " + typ)
+			}
+			return
+		})
 		if err != nil {
 			return fmt.Errorf("failed to get %v operation %v: %v", desc, opName, err)
 		}
@@ -291,4 +323,24 @@ func (ctx *Context) getMeta(path string) (string, error) {
 		return "", err
 	}
 	return string(body), nil
+}
+
+func (ctx *Context) apiCall(fn func() error) error {
+	rateLimited := 0
+	for {
+		<-ctx.apiRateGate
+		err := fn()
+		if err != nil {
+			if strings.Contains(err.Error(), "Rate Limit Exceeded") ||
+				strings.Contains(err.Error(), "rateLimitExceeded") {
+				rateLimited++
+				backoff := time.Duration(float64(rateLimited) * 1e9 * (rand.Float64() + 1))
+				time.Sleep(backoff)
+				if rateLimited < 20 {
+					continue
+				}
+			}
+		}
+		return err
+	}
 }

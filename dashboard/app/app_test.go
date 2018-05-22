@@ -7,20 +7,27 @@ package dash
 
 import (
 	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 )
 
 // Config used in tests.
 var config = GlobalConfig{
-	AuthDomain: "@foo.com",
+	AccessLevel: AccessPublic,
+	AuthDomain:  "@syzkaller.com",
 	Clients: map[string]string{
 		"reporting": "reportingkeyreportingkeyreportingkey",
 	},
+	EmailBlacklist: []string{
+		"\"Bar\" <BlackListed@Domain.com>",
+	},
 	Namespaces: map[string]*Config{
 		"test1": &Config{
-			Key: "test1keytest1keytest1key",
+			AccessLevel: AccessAdmin,
+			Key:         "test1keytest1keytest1key",
 			Clients: map[string]string{
 				client1: key1,
 			},
@@ -30,6 +37,13 @@ var config = GlobalConfig{
 					DailyLimit: 3,
 					Config: &TestConfig{
 						Index: 1,
+					},
+					Filter: func(bug *Bug) FilterResult {
+						if strings.HasPrefix(bug.Title, "skip without repro") &&
+							bug.ReproLevel != dashapi.ReproLevelNone {
+							return FilterSkip
+						}
+						return FilterReport
 					},
 				},
 				{
@@ -42,9 +56,16 @@ var config = GlobalConfig{
 			},
 		},
 		"test2": &Config{
-			Key: "test2keytest2keytest2key",
+			AccessLevel: AccessAdmin,
+			Key:         "test2keytest2keytest2key",
 			Clients: map[string]string{
 				client2: key2,
+			},
+			Managers: map[string]ConfigManager{
+				"restricted-manager": {
+					RestrictedTestingRepo:   "git://restricted.git/restricted.git",
+					RestrictedTestingReason: "you should test only on restricted.git",
+				},
 			},
 			Reporting: []Reporting{
 				{
@@ -59,9 +80,63 @@ var config = GlobalConfig{
 					Name:       "reporting2",
 					DailyLimit: 3,
 					Config: &EmailConfig{
-						Email:           "bugs@syzkaller.com",
-						MailMaintainers: true,
+						Email:              "bugs@syzkaller.com",
+						DefaultMaintainers: []string{"default@maintainers.com"},
+						MailMaintainers:    true,
 					},
+				},
+			},
+		},
+		// Namespaces for access level testing.
+		"access-admin": &Config{
+			AccessLevel: AccessAdmin,
+			Key:         "adminkeyadminkeyadminkey",
+			Clients: map[string]string{
+				clientAdmin: keyAdmin,
+			},
+			Reporting: []Reporting{
+				{
+					Name:   "access-admin-reporting1",
+					Config: &TestConfig{Index: 1},
+				},
+				{
+					Name:   "access-admin-reporting2",
+					Config: &TestConfig{Index: 2},
+				},
+			},
+		},
+		"access-user": &Config{
+			AccessLevel: AccessUser,
+			Key:         "userkeyuserkeyuserkey",
+			Clients: map[string]string{
+				clientUser: keyUser,
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessAdmin,
+					Name:        "access-admin-reporting1",
+					Config:      &TestConfig{Index: 1},
+				},
+				{
+					Name:   "access-user-reporting2",
+					Config: &TestConfig{Index: 2},
+				},
+			},
+		},
+		"access-public": &Config{
+			Key: "publickeypublickeypublickey",
+			Clients: map[string]string{
+				clientPublic: keyPublic,
+			},
+			Reporting: []Reporting{
+				{
+					AccessLevel: AccessUser,
+					Name:        "access-user-reporting1",
+					Config:      &TestConfig{Index: 1},
+				},
+				{
+					Name:   "access-public-reporting2",
+					Config: &TestConfig{Index: 2},
 				},
 			},
 		},
@@ -69,10 +144,16 @@ var config = GlobalConfig{
 }
 
 const (
-	client1 = "client1"
-	client2 = "client2"
-	key1    = "client1keyclient1keyclient1key"
-	key2    = "client2keyclient2keyclient2key"
+	client1      = "client1"
+	client2      = "client2"
+	key1         = "client1keyclient1keyclient1key"
+	key2         = "client2keyclient2keyclient2key"
+	clientAdmin  = "client-admin"
+	keyAdmin     = "clientadminkeyclientadminkey"
+	clientUser   = "client-user"
+	keyUser      = "clientuserkeyclientuserkey"
+	clientPublic = "client-public"
+	keyPublic    = "clientpublickeyclientpublickey"
 )
 
 type TestConfig struct {
@@ -93,16 +174,20 @@ func (cfg *TestConfig) Validate() error {
 
 func testBuild(id int) *dashapi.Build {
 	return &dashapi.Build{
-		Manager:         fmt.Sprintf("manager%v", id),
-		ID:              fmt.Sprintf("build%v", id),
-		SyzkallerCommit: fmt.Sprintf("syzkaller_commit%v", id),
-		CompilerID:      fmt.Sprintf("compiler%v", id),
-		KernelRepo:      fmt.Sprintf("repo%v", id),
-		KernelBranch:    fmt.Sprintf("branch%v", id),
-		KernelCommit:    fmt.Sprintf("kernel_commit%v", id),
-		KernelConfig:    []byte(fmt.Sprintf("config%v", id)),
+		Manager:           fmt.Sprintf("manager%v", id),
+		ID:                fmt.Sprintf("build%v", id),
+		SyzkallerCommit:   fmt.Sprintf("syzkaller_commit%v", id),
+		CompilerID:        fmt.Sprintf("compiler%v", id),
+		KernelRepo:        fmt.Sprintf("repo%v", id),
+		KernelBranch:      fmt.Sprintf("branch%v", id),
+		KernelCommit:      strings.Repeat(fmt.Sprint(id), 40)[:40],
+		KernelCommitTitle: fmt.Sprintf("kernel_commit_title%v", id),
+		KernelCommitDate:  buildCommitDate,
+		KernelConfig:      []byte(fmt.Sprintf("config%v", id)),
 	}
 }
+
+var buildCommitDate = time.Date(1, 2, 3, 4, 5, 6, 0, time.UTC)
 
 func testCrash(build *dashapi.Build, id int) *dashapi.Crash {
 	return &dashapi.Crash{
@@ -111,6 +196,14 @@ func testCrash(build *dashapi.Build, id int) *dashapi.Crash {
 		Log:     []byte(fmt.Sprintf("log%v", id)),
 		Report:  []byte(fmt.Sprintf("report%v", id)),
 	}
+}
+
+func testCrashWithRepro(build *dashapi.Build, id int) *dashapi.Crash {
+	crash := testCrash(build, id)
+	crash.ReproOpts = []byte(fmt.Sprintf("repro opts %v", id))
+	crash.ReproSyz = []byte(fmt.Sprintf("syncfs(%v)", id))
+	crash.ReproC = []byte(fmt.Sprintf("int main() { return %v; }", id))
+	return crash
 }
 
 func testCrashID(crash *dashapi.Crash) *dashapi.CrashID {
@@ -140,9 +233,9 @@ func TestApp(t *testing.T) {
 	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
 
 	// Some bad combinations of client/key.
-	c.expectFail("unauthorized request", c.API(client1, "", "upload_build", build, nil))
-	c.expectFail("unauthorized request", c.API("unknown", key1, "upload_build", build, nil))
-	c.expectFail("unauthorized request", c.API(client1, key2, "upload_build", build, nil))
+	c.expectFail("unauthorized", c.API(client1, "", "upload_build", build, nil))
+	c.expectFail("unauthorized", c.API("unknown", key1, "upload_build", build, nil))
+	c.expectFail("unauthorized", c.API(client1, key2, "upload_build", build, nil))
 
 	crash1 := &dashapi.Crash{
 		BuildID:     "build1",
@@ -186,11 +279,11 @@ func TestApp(t *testing.T) {
 	}
 	c.expectOK(c.API(client1, key1, "report_failed_repro", cid, nil))
 
-	pr := &dashapi.PollRequest{
+	pr := &dashapi.PollBugsRequest{
 		Type: "test",
 	}
-	resp := new(dashapi.PollResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll", pr, resp))
+	resp := new(dashapi.PollBugsResponse)
+	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, resp))
 
 	cmd := &dashapi.BugUpdate{
 		ID:         "id",
@@ -283,7 +376,7 @@ func testNeedRepro3(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
 	cid := testCrashID(crash1)
 	needReproResp := new(dashapi.NeedReproResp)
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < maxReproPerBug; i++ {
 		c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
 		c.expectEQ(resp.NeedRepro, true)
 
@@ -317,7 +410,7 @@ func testNeedRepro4(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
 	cid := testCrashID(crash1)
 	needReproResp := new(dashapi.NeedReproResp)
 
-	for i := 0; i < 4; i++ {
+	for i := 0; i < maxReproPerBug-1; i++ {
 		c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
 		c.expectEQ(resp.NeedRepro, true)
 
@@ -337,37 +430,6 @@ func TestNeedRepro4_dup(t *testing.T)         { testNeedRepro4(t, dupCrash) }
 func TestNeedRepro4_closed(t *testing.T)      { testNeedRepro4(t, closedCrash) }
 func TestNeedRepro4_closedRepro(t *testing.T) { testNeedRepro4(t, closedWithReproCrash) }
 
-func testNeedRepro5(t *testing.T, crashCtor func(c *Ctx) *dashapi.Crash) {
-	c := NewCtx(t)
-	defer c.Close()
-
-	crash1 := crashCtor(c)
-	crash1.ReproOpts = []byte("opts")
-	crash1.ReproSyz = []byte("repro syz")
-	resp := new(dashapi.ReportCrashResp)
-	cid := testCrashID(crash1)
-	needReproResp := new(dashapi.NeedReproResp)
-
-	for i := 0; i < 4; i++ {
-		c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-		c.expectEQ(resp.NeedRepro, true)
-
-		c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-		c.expectEQ(needReproResp.NeedRepro, true)
-	}
-
-	c.expectOK(c.API(client1, key1, "report_crash", crash1, resp))
-	c.expectEQ(resp.NeedRepro, false)
-
-	c.expectOK(c.API(client1, key1, "need_repro", cid, needReproResp))
-	c.expectEQ(needReproResp.NeedRepro, false)
-}
-
-func TestNeedRepro5_normal(t *testing.T)      { testNeedRepro5(t, normalCrash) }
-func TestNeedRepro5_dup(t *testing.T)         { testNeedRepro5(t, dupCrash) }
-func TestNeedRepro5_closed(t *testing.T)      { testNeedRepro5(t, closedCrash) }
-func TestNeedRepro5_closedRepro(t *testing.T) { testNeedRepro5(t, closedWithReproCrash) }
-
 func normalCrash(c *Ctx) *dashapi.Crash {
 	build := testBuild(1)
 	c.expectOK(c.API(client1, key1, "upload_build", build, nil))
@@ -384,11 +446,11 @@ func dupCrash(c *Ctx) *dashapi.Crash {
 	crash2 := testCrash(build, 2)
 	c.expectOK(c.API(client1, key1, "report_crash", crash2, nil))
 
-	pr := &dashapi.PollRequest{
+	pr := &dashapi.PollBugsRequest{
 		Type: "test",
 	}
-	resp := new(dashapi.PollResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll", pr, resp))
+	resp := new(dashapi.PollBugsResponse)
+	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, resp))
 	c.expectEQ(len(resp.Reports), 2)
 	rep1 := resp.Reports[0]
 	rep2 := resp.Reports[1]
@@ -424,11 +486,11 @@ func closedCrashImpl(c *Ctx, withRepro bool) *dashapi.Crash {
 	c.expectOK(c.API(client1, key1, "report_crash", crash, resp))
 	c.expectEQ(resp.NeedRepro, !withRepro)
 
-	pr := &dashapi.PollRequest{
+	pr := &dashapi.PollBugsRequest{
 		Type: "test",
 	}
-	pollResp := new(dashapi.PollResponse)
-	c.expectOK(c.API(client1, key1, "reporting_poll", pr, pollResp))
+	pollResp := new(dashapi.PollBugsResponse)
+	c.expectOK(c.API(client1, key1, "reporting_poll_bugs", pr, pollResp))
 	c.expectEQ(len(pollResp.Reports), 1)
 	rep := pollResp.Reports[0]
 	cmd := &dashapi.BugUpdate{

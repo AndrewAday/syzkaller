@@ -5,19 +5,20 @@ package host
 
 import (
 	"bytes"
+	"fmt"
 	"io/ioutil"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
 )
 
-// DetectSupportedSyscalls returns list on supported syscalls on host.
-func DetectSupportedSyscalls(target *prog.Target) (map[*prog.Syscall]bool, error) {
-	// There are 3 possible strategies:
+func isSupported(c *prog.Syscall, sandbox string) (bool, string) {
+	// There are 3 possible strategies for detecting supported syscalls:
 	// 1. Executes all syscalls with presumably invalid arguments and check for ENOprog.
 	//    But not all syscalls are safe to execute. For example, pause will hang,
 	//    while setpgrp will push the process into own process group.
@@ -26,52 +27,57 @@ func DetectSupportedSyscalls(target *prog.Target) (map[*prog.Syscall]bool, error
 	//    For example, on x86_64 it says that sendfile is not present (only sendfile64).
 	// 3. Check sys_syscallname in /proc/kallsyms.
 	//    Requires CONFIG_KALLSYMS. Seems to be the most reliable. That's what we use here.
-
-	kallsyms, _ := ioutil.ReadFile("/proc/kallsyms")
-	supported := make(map[*prog.Syscall]bool)
-	for _, c := range target.Syscalls {
-		if isSupported(kallsyms, c) {
-			supported[c] = true
-		}
-	}
-	return supported, nil
-}
-
-func isSupported(kallsyms []byte, c *prog.Syscall) bool {
+	kallsymsOnce.Do(func() {
+		kallsyms, _ = ioutil.ReadFile("/proc/kallsyms")
+	})
 	if strings.HasPrefix(c.CallName, "syz_") {
-		return isSupportedSyzkall(c)
+		return isSupportedSyzkall(sandbox, c)
 	}
 	if strings.HasPrefix(c.Name, "socket$") {
 		return isSupportedSocket(c)
-	}
-	if strings.HasPrefix(c.Name, "open$") {
-		return isSupportedOpen(c)
 	}
 	if strings.HasPrefix(c.Name, "openat$") {
 		return isSupportedOpenAt(c)
 	}
 	if len(kallsyms) == 0 {
-		return true
+		return true, ""
 	}
-	return bytes.Index(kallsyms, []byte(" T sys_"+c.CallName+"\n")) != -1
+	name := c.CallName
+	if newname := kallsymsMap[name]; newname != "" {
+		name = newname
+	}
+	if !bytes.Contains(kallsyms, []byte(" T sys_"+name+"\n")) &&
+		!bytes.Contains(kallsyms, []byte(" T ksys_"+name+"\n")) &&
+		!bytes.Contains(kallsyms, []byte(" T __ia32_sys_"+name+"\n")) &&
+		!bytes.Contains(kallsyms, []byte(" T __x64_sys_"+name+"\n")) {
+		return false, fmt.Sprintf("sys_%v is not present in /proc/kallsyms", name)
+	}
+	return true, ""
 }
 
-func isSupportedSyzkall(c *prog.Syscall) bool {
+// Some syscall names diverge in __NR_* consts and kallsyms.
+// umount2 is renamed to umount in arch/x86/entry/syscalls/syscall_64.tbl.
+// Where umount is renamed to oldumount is unclear.
+var (
+	kallsyms     []byte
+	kallsymsOnce sync.Once
+	kallsymsMap  = map[string]string{
+		"umount":  "oldumount",
+		"umount2": "umount",
+	}
+)
+
+func isSupportedSyzkall(sandbox string, c *prog.Syscall) (bool, string) {
 	switch c.CallName {
-	case "syz_test":
-		return false
 	case "syz_open_dev":
 		if _, ok := c.Args[0].(*prog.ConstType); ok {
 			// This is for syz_open_dev$char/block.
 			// They are currently commented out, but in case one enables them.
-			return true
+			return true, ""
 		}
 		fname, ok := extractStringConst(c.Args[0])
 		if !ok {
 			panic("first open arg is not a pointer to string const")
-		}
-		if syscall.Getuid() != 0 {
-			return false
 		}
 		var check func(dev string) bool
 		check = func(dev string) bool {
@@ -85,65 +91,112 @@ func isSupportedSyzkall(c *prog.Syscall) bool {
 			}
 			return false
 		}
-		return check(fname)
+		if !check(fname) {
+			return false, fmt.Sprintf("file %v does not exist", fname)
+		}
+		return onlySandboxNoneOrNamespace(sandbox)
+	case "syz_open_procfs":
+		return true, ""
 	case "syz_open_pts":
-		return true
+		return true, ""
 	case "syz_fuse_mount":
-		return osutil.IsExist("/dev/fuse")
+		if !osutil.IsExist("/dev/fuse") {
+			return false, "/dev/fuse does not exist"
+		}
+		return onlySandboxNoneOrNamespace(sandbox)
 	case "syz_fuseblk_mount":
-		return osutil.IsExist("/dev/fuse") && syscall.Getuid() == 0
+		if !osutil.IsExist("/dev/fuse") {
+			return false, "/dev/fuse does not exist"
+		}
+		return onlySandboxNoneOrNamespace(sandbox)
 	case "syz_emit_ethernet", "syz_extract_tcp_res":
 		fd, err := syscall.Open("/dev/net/tun", syscall.O_RDWR, 0)
-		if err == nil {
-			syscall.Close(fd)
+		if err != nil {
+			return false, fmt.Sprintf("open(/dev/net/tun) failed: %v", err)
 		}
-		return err == nil && syscall.Getuid() == 0
+		syscall.Close(fd)
+		return true, ""
 	case "syz_kvm_setup_cpu":
 		switch c.Name {
 		case "syz_kvm_setup_cpu$x86":
-			return runtime.GOARCH == "amd64" || runtime.GOARCH == "386"
+			if runtime.GOARCH == "amd64" || runtime.GOARCH == "386" {
+				return true, ""
+			}
 		case "syz_kvm_setup_cpu$arm64":
-			return runtime.GOARCH == "arm64"
+			if runtime.GOARCH == "arm64" {
+				return true, ""
+			}
 		}
+		return false, "unsupported arch"
+	case "syz_init_net_socket":
+		// Unfortunately this only works with sandbox none at the moment.
+		// The problem is that setns of a network namespace requires CAP_SYS_ADMIN
+		// in the target namespace, and we've lost all privs in the init namespace
+		// during creation of a user namespace.
+		if ok, reason := onlySandboxNone(sandbox); !ok {
+			return false, reason
+		}
+		return isSupportedSocket(c)
+	case "syz_genetlink_get_family_id":
+		fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_RAW, syscall.NETLINK_GENERIC)
+		if fd == -1 {
+			return false, fmt.Sprintf("socket(AF_NETLINK, SOCK_RAW, NETLINK_GENERIC) failed: %v", err)
+		}
+		syscall.Close(fd)
+		return true, ""
+	case "syz_mount_image":
+		return onlySandboxNone(sandbox)
+	case "syz_read_part_table":
+		return onlySandboxNone(sandbox)
 	}
 	panic("unknown syzkall: " + c.Name)
 }
 
-func isSupportedSocket(c *prog.Syscall) bool {
+func onlySandboxNone(sandbox string) (bool, string) {
+	if syscall.Getuid() != 0 || sandbox != "none" {
+		return false, "only supported under root with sandbox=none"
+	}
+	return true, ""
+}
+
+func onlySandboxNoneOrNamespace(sandbox string) (bool, string) {
+	if syscall.Getuid() != 0 || sandbox == "setuid" {
+		return false, "only supported under root with sandbox=none/namespace"
+	}
+	return true, ""
+}
+
+func isSupportedSocket(c *prog.Syscall) (bool, string) {
 	af, ok := c.Args[0].(*prog.ConstType)
 	if !ok {
-		println(c.Name)
 		panic("socket family is not const")
 	}
 	fd, err := syscall.Socket(int(af.Val), 0, 0)
 	if fd != -1 {
 		syscall.Close(fd)
 	}
-	return err != syscall.ENOSYS && err != syscall.EAFNOSUPPORT
+	if err == syscall.ENOSYS {
+		return false, "socket syscall returns ENOSYS"
+	}
+	if err == syscall.EAFNOSUPPORT {
+		return false, "socket family is not supported (EAFNOSUPPORT)"
+	}
+	return true, ""
 }
 
-func isSupportedOpen(c *prog.Syscall) bool {
-	fname, ok := extractStringConst(c.Args[0])
-	if !ok {
-		return true
-	}
-	fd, err := syscall.Open(fname, syscall.O_RDONLY, 0)
-	if fd != -1 {
-		syscall.Close(fd)
-	}
-	return err == nil
-}
-
-func isSupportedOpenAt(c *prog.Syscall) bool {
+func isSupportedOpenAt(c *prog.Syscall) (bool, string) {
 	fname, ok := extractStringConst(c.Args[1])
-	if !ok {
-		return true
+	if !ok || len(fname) == 0 || fname[0] != '/' {
+		return true, ""
 	}
 	fd, err := syscall.Open(fname, syscall.O_RDONLY, 0)
 	if fd != -1 {
 		syscall.Close(fd)
 	}
-	return err == nil
+	if err != nil {
+		return false, fmt.Sprintf("open(%v) failed: %v", fname, err)
+	}
+	return true, ""
 }
 
 func extractStringConst(typ prog.Type) (string, bool) {
@@ -158,4 +211,23 @@ func extractStringConst(typ prog.Type) (string, bool) {
 	v := str.Values[0]
 	v = v[:len(v)-1] // string terminating \x00
 	return v, true
+}
+
+func EnableFaultInjection() error {
+	if err := osutil.WriteFile("/sys/kernel/debug/failslab/ignore-gfp-wait", []byte("N")); err != nil {
+		return fmt.Errorf("failed to write /failslab/ignore-gfp-wait: %v", err)
+	}
+	if err := osutil.WriteFile("/sys/kernel/debug/fail_futex/ignore-private", []byte("N")); err != nil {
+		return fmt.Errorf("failed to write /fail_futex/ignore-private: %v", err)
+	}
+	if err := osutil.WriteFile("/sys/kernel/debug/fail_page_alloc/ignore-gfp-highmem", []byte("N")); err != nil {
+		return fmt.Errorf("failed to write /fail_page_alloc/ignore-gfp-highmem: %v", err)
+	}
+	if err := osutil.WriteFile("/sys/kernel/debug/fail_page_alloc/ignore-gfp-wait", []byte("N")); err != nil {
+		return fmt.Errorf("failed to write /fail_page_alloc/ignore-gfp-wait: %v", err)
+	}
+	if err := osutil.WriteFile("/sys/kernel/debug/fail_page_alloc/min-order", []byte("0")); err != nil {
+		return fmt.Errorf("failed to write /fail_page_alloc/min-order: %v", err)
+	}
+	return nil
 }

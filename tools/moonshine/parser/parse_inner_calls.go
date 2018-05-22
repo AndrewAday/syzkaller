@@ -90,11 +90,11 @@ func parse_InetAddr(syzType prog.Type, straceType *strace_types.Call, ctx *Conte
 		default:
 			optType = unionType.Fields[7]
 		}
-		inner_arg = prog.DefaultArg(optType)
+		inner_arg = ctx.Target.DefaultArg(optType)
 	default:
 		panic("Parsing inet_addr and inner arg has non ipv4 type")
 	}
-	return strace_types.UnionArg(syzType, inner_arg, optType)
+	return strace_types.UnionArg(syzType, inner_arg)
 }
 
 func parse_InetPton(syzType prog.Type, straceType *strace_types.Call, ctx *Context) prog.Arg {
@@ -114,9 +114,9 @@ func parse_InetPton(syzType prog.Type, straceType *strace_types.Call, ctx *Conte
 		default:
 			optType = unionType.Fields[0]
 		}
-		inner_arg = prog.DefaultArg(optType)
+		inner_arg = ctx.Target.DefaultArg(optType)
 	default:
 		panic("Parsing inet_addr and inner arg has non ipv4 type")
 	}
-	return strace_types.UnionArg(syzType, inner_arg, optType)
+	return strace_types.UnionArg(syzType, inner_arg)
 }

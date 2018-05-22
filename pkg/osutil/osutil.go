@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"time"
 )
 
@@ -22,38 +21,64 @@ const (
 
 // RunCmd runs "bin args..." in dir with timeout and returns its output.
 func RunCmd(timeout time.Duration, dir, bin string, args ...string) ([]byte, error) {
-	return runCmd(timeout, nil, dir, bin, args...)
-}
-
-// RunCmdEnv is the same as RunCmd but also appends env.
-func RunCmdEnv(timeout time.Duration, env []string, dir, bin string, args ...string) ([]byte, error) {
-	return runCmd(timeout, env, dir, bin, args...)
-}
-
-func runCmd(timeout time.Duration, env []string, dir, bin string, args ...string) ([]byte, error) {
-	output := new(bytes.Buffer)
-	cmd := exec.Command(bin, args...)
+	cmd := Command(bin, args...)
 	cmd.Dir = dir
+	return Run(timeout, cmd)
+}
+
+// Run runs cmd with the specified timeout.
+// Returns combined output. If the command fails, err includes output.
+func Run(timeout time.Duration, cmd *exec.Cmd) ([]byte, error) {
+	output := new(bytes.Buffer)
 	cmd.Stdout = output
 	cmd.Stderr = output
-	cmd.Env = append([]string{}, os.Environ()...)
-	cmd.Env = append(cmd.Env, env...)
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("failed to start %v %+v: %v", bin, args, err)
+		return nil, fmt.Errorf("failed to start %v %+v: %v", cmd.Path, cmd.Args, err)
 	}
 	done := make(chan bool)
+	timer := time.NewTimer(timeout)
 	go func() {
 		select {
-		case <-time.After(time.Hour):
+		case <-timer.C:
 			cmd.Process.Kill()
 		case <-done:
+			timer.Stop()
 		}
 	}()
 	defer close(done)
 	if err := cmd.Wait(); err != nil {
-		return nil, fmt.Errorf("failed to run %v %+v: %v\n%v", bin, args, err, output.String())
+		return nil, &VerboseError{
+			Title:  fmt.Sprintf("failed to run %v %+v: %v", cmd.Path, cmd.Args, err),
+			Output: output.Bytes(),
+		}
 	}
 	return output.Bytes(), nil
+}
+
+// Command is similar to os/exec.Command, but also sets PDEATHSIG on linux.
+func Command(bin string, args ...string) *exec.Cmd {
+	cmd := exec.Command(bin, args...)
+	setPdeathsig(cmd)
+	return cmd
+}
+
+type VerboseError struct {
+	Title  string
+	Output []byte
+}
+
+func (err *VerboseError) Error() string {
+	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
+}
+
+func PrependContext(ctx string, err error) error {
+	switch err1 := err.(type) {
+	case *VerboseError:
+		err1.Title = fmt.Sprintf("%v: %v", ctx, err1.Title)
+		return err1
+	default:
+		return fmt.Errorf("%v: %v", ctx, err)
+	}
 }
 
 // IsExist returns true if the file name exists.
@@ -137,6 +162,17 @@ func WriteExecFile(filename string, data []byte) error {
 	return ioutil.WriteFile(filename, data, DefaultExecPerm)
 }
 
+// TempFile creates a unique temp filename.
+// Note: the file already exists when the function returns.
+func TempFile(prefix string) (string, error) {
+	f, err := ioutil.TempFile("", prefix)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %v", err)
+	}
+	f.Close()
+	return f.Name(), nil
+}
+
 // Return all files in a directory.
 func ListDir(dir string) ([]string, error) {
 	f, err := os.Open(dir)
@@ -150,9 +186,6 @@ func ListDir(dir string) ([]string, error) {
 var wd string
 
 func init() {
-	if runtime.GOOS == "fuchsia" {
-		return
-	}
 	var err error
 	wd, err = os.Getwd()
 	if err != nil {
@@ -161,10 +194,6 @@ func init() {
 }
 
 func Abs(path string) string {
-	if runtime.GOOS == "fuchsia" {
-		// Getwd/Abs are not supported on fuchsia. Let's hope for best.
-		return path
-	}
 	if wd1, err := os.Getwd(); err == nil && wd1 != wd {
 		panic("don't mess with wd in a concurrent program")
 	}

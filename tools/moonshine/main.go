@@ -27,7 +27,8 @@ var (
 const (
 	OS = "linux"
 	Arch = "amd64"
-	pageSize = 4096
+	currentDBVersion = 3
+
 )
 
 func main() {
@@ -37,6 +38,7 @@ func main() {
 	if err != nil {
 		Failf("error getting target: %v", err.Error())
 	} else {
+		fmt.Printf("Const Map len: %d\n", len(target.ConstMap))
 		ParseTraces(target, false)
 		pack("serialized", "corpus.db")
 	}
@@ -44,7 +46,7 @@ func main() {
 
 func progIsTooLarge(prog_ *prog.Prog) bool {
 	buff := make([]byte, prog.ExecBufferSize)
-	if err := prog_.SerializeForExec(buff, 0); err != nil {
+	if _, err := prog_.SerializeForExec(buff); err != nil {
 		return true
 	}
 	return false
@@ -109,17 +111,25 @@ func ParseTree(tree *strace_types.TraceTree, pid int64, target *prog.Target) []*
 	if err != nil {
 		panic("Failed to parse program")
 	} else {
-		if err = ctx.State.Tracker.FillOutMemory(parsedProg); err != nil {
-			fmt.Fprintf(os.Stderr, "Out of bounds memory: %s %d\n", tree.Filename, pid)
+		if len(parsedProg.Calls) == 0 {
 			parsedProg = nil
-		} else {
-			totalMemory := ctx.State.Tracker.GetTotalMemoryAllocations(parsedProg)
-			mmapCall := ctx.Target.MakeMmap(0, uint64(totalMemory/pageSize)+1)
-			calls := make([]*prog.Call, 0)
-			calls = append(append(calls, mmapCall), parsedProg.Calls...)
-			parsedProg.Calls = calls
-			if err := parsedProg.Validate(); err != nil {
-				panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
+		}else {
+			if err = ctx.State.Tracker.FillOutMemory(parsedProg); err != nil {
+				fmt.Fprintf(os.Stderr, "Out of bounds memory: %s %d\n", tree.Filename, pid)
+				parsedProg = nil
+			} else {
+				totalMemory := ctx.State.Tracker.GetTotalMemoryAllocations(parsedProg)
+				if totalMemory == 0 {
+					fmt.Printf("length of zero mem prog: %d\n", totalMemory)
+				} else {
+					mmapCall := ctx.Target.MakeMmap(0, uint64(totalMemory))
+					calls := make([]*prog.Call, 0)
+					calls = append(append(calls, mmapCall), parsedProg.Calls...)
+					parsedProg.Calls = calls
+				}
+				if err := parsedProg.Validate(); err != nil {
+					panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
+				}
 			}
 		}
 	}
@@ -143,6 +153,7 @@ func pack(dir, file string) {
 	}
 	os.Remove(file)
 	db, err := db.Open(file)
+	db.BumpVersion(currentDBVersion)
 	if err != nil {
 		Failf("failed to open database file: %v", err)
 	}

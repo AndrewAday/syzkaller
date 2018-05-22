@@ -4,33 +4,32 @@
 package prog
 
 func (p *Prog) Clone() *Prog {
-	p1, _ := p.cloneImpl(false)
-	return p1
-}
-
-func (p *Prog) cloneImpl(full bool) (*Prog, map[Arg]Arg) {
 	p1 := &Prog{
 		Target: p.Target,
+		Calls:  make([]*Call, len(p.Calls)),
 	}
-	newargs := make(map[Arg]Arg)
-	for _, c := range p.Calls {
+	newargs := make(map[*ResultArg]*ResultArg)
+	for ci, c := range p.Calls {
 		c1 := new(Call)
 		c1.Meta = c.Meta
-		c1.Ret = clone(c.Ret, newargs, full)
-		for _, arg := range c.Args {
-			c1.Args = append(c1.Args, clone(arg, newargs, full))
+		if c.Ret != nil {
+			c1.Ret = clone(c.Ret, newargs).(*ResultArg)
 		}
-		p1.Calls = append(p1.Calls, c1)
+		c1.Args = make([]Arg, len(c.Args))
+		for ai, arg := range c.Args {
+			c1.Args[ai] = clone(arg, newargs)
+		}
+		p1.Calls[ci] = c1
 	}
 	if debug {
 		if err := p1.validate(); err != nil {
 			panic(err)
 		}
 	}
-	return p1, newargs
+	return p1
 }
 
-func clone(arg Arg, newargs map[Arg]Arg, full bool) Arg {
+func clone(arg Arg, newargs map[*ResultArg]*ResultArg) Arg {
 	var arg1 Arg
 	switch a := arg.(type) {
 	case *ConstArg:
@@ -42,51 +41,42 @@ func clone(arg Arg, newargs map[Arg]Arg, full bool) Arg {
 		*a1 = *a
 		arg1 = a1
 		if a.Res != nil {
-			a1.Res = clone(a.Res, newargs, full)
+			a1.Res = clone(a.Res, newargs)
 		}
 	case *DataArg:
 		a1 := new(DataArg)
 		*a1 = *a
-		a1.Data = append([]byte{}, a.Data...)
+		a1.data = append([]byte{}, a.data...)
 		arg1 = a1
 	case *GroupArg:
 		a1 := new(GroupArg)
 		*a1 = *a
 		arg1 = a1
-		a1.Inner = nil
-		for _, arg2 := range a.Inner {
-			a1.Inner = append(a1.Inner, clone(arg2, newargs, full))
+		a1.Inner = make([]Arg, len(a.Inner))
+		for i, arg2 := range a.Inner {
+			a1.Inner[i] = clone(arg2, newargs)
 		}
 	case *UnionArg:
 		a1 := new(UnionArg)
 		*a1 = *a
 		arg1 = a1
-		a1.Option = clone(a.Option, newargs, full)
+		a1.Option = clone(a.Option, newargs)
 	case *ResultArg:
 		a1 := new(ResultArg)
 		*a1 = *a
 		arg1 = a1
-	case *ReturnArg:
-		a1 := new(ReturnArg)
-		*a1 = *a
-		arg1 = a1
+		if a1.Res != nil {
+			r := newargs[a1.Res]
+			a1.Res = r
+			if r.uses == nil {
+				r.uses = make(map[*ResultArg]bool)
+			}
+			r.uses[a1] = true
+		}
+		a1.uses = nil // filled when we clone the referent
+		newargs[a] = a1
 	default:
 		panic("bad arg kind")
-	}
-	if user, ok := arg1.(ArgUser); ok && *user.Uses() != nil {
-		r := newargs[*user.Uses()]
-		*user.Uses() = r
-		used := r.(ArgUsed)
-		if *used.Used() == nil {
-			*used.Used() = make(map[Arg]bool)
-		}
-		(*used.Used())[arg1] = true
-	}
-	if used, ok := arg1.(ArgUsed); ok {
-		*used.Used() = nil // filled when we clone the referent
-		newargs[arg] = arg1
-	} else if full {
-		newargs[arg] = arg1
 	}
 	return arg1
 }

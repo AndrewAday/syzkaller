@@ -35,11 +35,15 @@ func LoadData(data []byte, cfg interface{}) error {
 }
 
 func SaveFile(filename string, cfg interface{}) error {
-	data, err := json.MarshalIndent(cfg, "", "\t")
+	data, err := SaveData(cfg)
 	if err != nil {
 		return err
 	}
 	return osutil.WriteFile(filename, data)
+}
+
+func SaveData(cfg interface{}) ([]byte, error) {
+	return json.MarshalIndent(cfg, "", "\t")
 }
 
 func checkUnknownFields(data []byte, typ reflect.Type) error {
@@ -59,10 +63,18 @@ func checkUnknownFieldsRec(data []byte, prefix string, typ reflect.Type) error {
 	fields := make(map[string]reflect.Type)
 	for i := 0; i < typ.NumField(); i++ {
 		field := typ.Field(i)
-		if field.Tag.Get("json") == "-" {
+		tag := field.Tag.Get("json")
+		if tag == "-" {
 			continue
 		}
-		fields[strings.ToLower(field.Name)] = field.Type
+		name := strings.ToLower(field.Name)
+		if tag != "" {
+			if tag != strings.ToLower(tag) {
+				return fmt.Errorf("json tag on '%v%v' should be lower-case", prefix, name)
+			}
+			name = tag
+		}
+		fields[name] = field.Type
 	}
 	f := make(map[string]interface{})
 	if err := json.Unmarshal(data, &f); err != nil {
@@ -106,7 +118,7 @@ func checkUnknownFieldsStruct(val interface{}, prefix string, typ reflect.Type) 
 	}
 	inner, err := json.Marshal(val)
 	if err != nil {
-		return fmt.Errorf("failed to marshal inner struct '%v%v':", prefix, err)
+		return fmt.Errorf("failed to marshal inner struct %q: %v", prefix, err)
 	}
 	return checkUnknownFieldsRec(inner, prefix, typ)
 }

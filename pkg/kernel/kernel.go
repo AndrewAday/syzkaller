@@ -12,6 +12,7 @@
 package kernel
 
 import (
+	"bytes"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -24,25 +25,47 @@ import (
 	"github.com/google/syzkaller/pkg/osutil"
 )
 
-func Build(dir, compiler, config string) error {
-	if err := osutil.CopyFile(config, filepath.Join(dir, ".config")); err != nil {
+func Build(dir, compiler string, config []byte) error {
+	configFile := filepath.Join(dir, ".config")
+	if err := osutil.WriteFile(configFile, config); err != nil {
 		return fmt.Errorf("failed to write config file: %v", err)
 	}
-	return build(dir, compiler)
-}
-
-func build(dir, compiler string) error {
-	const timeout = 10 * time.Minute // default timeout for command invocations
-	if _, err := osutil.RunCmd(timeout, dir, "make", "olddefconfig"); err != nil {
+	if err := osutil.SandboxChown(configFile); err != nil {
+		return err
+	}
+	// One would expect olddefconfig here, but olddefconfig is not present in v3.6 and below.
+	// oldconfig is the same as olddefconfig if stdin is not set.
+	cmd := osutil.Command("make", "oldconfig")
+	if err := osutil.Sandbox(cmd, true, true); err != nil {
+		return err
+	}
+	cmd.Dir = dir
+	if _, err := osutil.Run(10*time.Minute, cmd); err != nil {
 		return err
 	}
 	// We build only bzImage as we currently don't use modules.
-	// Build of a large kernel can take a while on a 1 CPU VM.
 	cpu := strconv.Itoa(runtime.NumCPU())
-	if _, err := osutil.RunCmd(3*time.Hour, dir, "make", "bzImage", "-j", cpu, "CC="+compiler); err != nil {
+	cmd = osutil.Command("make", "bzImage", "-j", cpu, "CC="+compiler)
+	if err := osutil.Sandbox(cmd, true, true); err != nil {
 		return err
 	}
+	cmd.Dir = dir
+	// Build of a large kernel can take a while on a 1 CPU VM.
+	if _, err := osutil.Run(3*time.Hour, cmd); err != nil {
+		return extractRootCause(err)
+	}
 	return nil
+}
+
+func Clean(dir string) error {
+	cpu := strconv.Itoa(runtime.NumCPU())
+	cmd := osutil.Command("make", "distclean", "-j", cpu)
+	if err := osutil.Sandbox(cmd, true, true); err != nil {
+		return err
+	}
+	cmd.Dir = dir
+	_, err := osutil.Run(10*time.Minute, cmd)
+	return err
 }
 
 // CreateImage creates a disk image that is suitable for syzkaller.
@@ -50,7 +73,14 @@ func build(dir, compiler string) error {
 // If cmdlineFile is not empty, contents of the file are appended to the kernel command line.
 // If sysctlFile is not empty, contents of the file are appended to the image /etc/sysctl.conf.
 // Produces image and root ssh key in the specified files.
-func CreateImage(kernelDir, userspaceDir, cmdlineFile, sysctlFile, image, sshkey string) error {
+func CreateImage(targetOS, targetArch, vmType, kernelDir, userspaceDir, cmdlineFile, sysctlFile,
+	image, sshkey string) error {
+	if targetOS != "linux" || targetArch != "amd64" {
+		return fmt.Errorf("only linux/amd64 is supported")
+	}
+	if vmType != "qemu" && vmType != "gce" {
+		return fmt.Errorf("images can be built only for qemu/gce machines")
+	}
 	tempDir, err := ioutil.TempDir("", "syz-build")
 	if err != nil {
 		return err
@@ -61,14 +91,18 @@ func CreateImage(kernelDir, userspaceDir, cmdlineFile, sysctlFile, image, sshkey
 		return fmt.Errorf("failed to write script file: %v", err)
 	}
 	bzImage := filepath.Join(kernelDir, filepath.FromSlash("arch/x86/boot/bzImage"))
-	env := []string{
-		"SYZ_CMDLINE_FILE=" + osutil.Abs(cmdlineFile),
-		"SYZ_SYSCTL_FILE=" + osutil.Abs(sysctlFile),
-	}
-	_, err = osutil.RunCmdEnv(time.Hour, env, tempDir, scriptFile, userspaceDir, bzImage)
-	if err != nil {
+	cmd := osutil.Command(scriptFile, userspaceDir, bzImage)
+	cmd.Dir = tempDir
+	cmd.Env = append([]string{}, os.Environ()...)
+	cmd.Env = append(cmd.Env,
+		"SYZ_VM_TYPE="+vmType,
+		"SYZ_CMDLINE_FILE="+osutil.Abs(cmdlineFile),
+		"SYZ_SYSCTL_FILE="+osutil.Abs(sysctlFile),
+	)
+	if _, err = osutil.Run(time.Hour, cmd); err != nil {
 		return fmt.Errorf("image build failed: %v", err)
 	}
+	// Note: we use CopyFile instead of Rename because src and dst can be on different filesystems.
 	if err := osutil.CopyFile(filepath.Join(tempDir, "disk.raw"), image); err != nil {
 		return err
 	}
@@ -90,4 +124,40 @@ func CompilerIdentity(compiler string) (string, error) {
 		return "", fmt.Errorf("no output from compiler --version")
 	}
 	return strings.Split(string(output), "\n")[0], nil
+}
+
+func extractRootCause(err error) error {
+	verr, ok := err.(*osutil.VerboseError)
+	if !ok {
+		return err
+	}
+	var cause []byte
+	for _, line := range bytes.Split(verr.Output, []byte{'\n'}) {
+		for _, pattern := range buildFailureCauses {
+			if pattern.weak && cause != nil {
+				continue
+			}
+			if bytes.Contains(line, pattern.pattern) {
+				cause = line
+				break
+			}
+		}
+	}
+	if cause != nil {
+		verr.Title = string(cause)
+	}
+	return verr
+}
+
+type buildFailureCause struct {
+	pattern []byte
+	weak    bool
+}
+
+var buildFailureCauses = [...]buildFailureCause{
+	{pattern: []byte(": error: ")},
+	{pattern: []byte(": fatal error: ")},
+	{pattern: []byte(": undefined reference to")},
+	{weak: true, pattern: []byte(": final link failed: ")},
+	{weak: true, pattern: []byte("collect2: error: ")},
 }

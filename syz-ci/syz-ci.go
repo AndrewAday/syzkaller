@@ -41,6 +41,11 @@ package main
 //		workdir/	: manager workdir (never deleted)
 //		latest/		: latest good kernel image build
 //		current/	: kernel image currently in use
+// jobs/
+//	linux/			: one dir per target OS
+//		kernel/		: kernel checkout
+//		image/		: currently used image
+//		workdir/	: some temp files
 //
 // Current executable, syzkaller and kernel builds are marked with tag files.
 // Tag files uniquely identify the build (git hash, compiler identity, kernel config, etc).
@@ -55,7 +60,7 @@ import (
 	"sync"
 
 	"github.com/google/syzkaller/pkg/config"
-	. "github.com/google/syzkaller/pkg/log"
+	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/syz-manager/mgrconfig"
 )
@@ -63,38 +68,47 @@ import (
 var flagConfig = flag.String("config", "", "config file")
 
 type Config struct {
-	Name                   string
-	Http                   string
-	Dashboard_Addr         string // Optional.
-	Hub_Addr               string // Optional.
-	Hub_Key                string // Optional.
-	Goroot                 string // Go 1.8+ toolchain dir.
-	Syzkaller_Repo         string
-	Syzkaller_Branch       string
-	Syzkaller_Descriptions string // Dir with additional syscall descriptions (.txt and .const files).
-	Managers               []*ManagerConfig
+	Name            string `json:"name"`
+	HTTP            string `json:"http"`
+	DashboardAddr   string `json:"dashboard_addr"`   // Optional.
+	DashboardClient string `json:"dashboard_client"` // Optional.
+	DashboardKey    string `json:"dashboard_key"`    // Optional.
+	HubAddr         string `json:"hub_addr"`         // Optional.
+	HubKey          string `json:"hub_key"`          // Optional.
+	Goroot          string `json:"goroot"`           // Go 1.8+ toolchain dir.
+	SyzkallerRepo   string `json:"syzkaller_repo"`
+	SyzkallerBranch string `json:"syzkaller_branch"`
+	// Dir with additional syscall descriptions (.txt and .const files).
+	SyzkallerDescriptions string `json:"syzkaller_descriptions"`
+	// Enable patch testing jobs.
+	EnableJobs bool             `json:"enable_jobs"`
+	Managers   []*ManagerConfig `json:"managers"`
 }
 
 type ManagerConfig struct {
-	Name             string
-	Dashboard_Client string
-	Dashboard_Key    string
-	Repo             string
-	Branch           string
-	Compiler         string
-	Userspace        string
-	Kernel_Config    string
-	Kernel_Cmdline   string // File with kernel cmdline values (optional).
-	Kernel_Sysctl    string // File with sysctl values (e.g. output of sysctl -a, optional).
-	Manager_Config   json.RawMessage
+	Name            string `json:"name"`
+	DashboardClient string `json:"dashboard_client"`
+	DashboardKey    string `json:"dashboard_key"`
+	Repo            string `json:"repo"`
+	// Short name of the repo (e.g. "linux-next"), used only for reporting.
+	RepoAlias    string `json:"repo_alias"`
+	Branch       string `json:"branch"`
+	Compiler     string `json:"compiler"`
+	Userspace    string `json:"userspace"`
+	KernelConfig string `json:"kernel_config"`
+	// File with kernel cmdline values (optional).
+	KernelCmdline string `json:"kernel_cmdline"`
+	// File with sysctl values (e.g. output of sysctl -a, optional).
+	KernelSysctl  string          `json:"kernel_sysctl"`
+	ManagerConfig json.RawMessage `json:"manager_config"`
 }
 
 func main() {
 	flag.Parse()
-	EnableLogCaching(1000, 1<<20)
+	log.EnableLogCaching(1000, 1<<20)
 	cfg, err := loadConfig(*flagConfig)
 	if err != nil {
-		Fatalf("failed to load config: %v", err)
+		log.Fatalf("failed to load config: %v", err)
 	}
 
 	shutdownPending := make(chan struct{})
@@ -108,6 +122,8 @@ func main() {
 		close(updatePending)
 	}()
 
+	var wg sync.WaitGroup
+	wg.Add(1)
 	stop := make(chan struct{})
 	go func() {
 		select {
@@ -115,23 +131,30 @@ func main() {
 		case <-updatePending:
 		}
 		close(stop)
+		wg.Done()
 	}()
 
-	var wg sync.WaitGroup
-	wg.Add(len(cfg.Managers))
 	managers := make([]*Manager, len(cfg.Managers))
 	for i, mgrcfg := range cfg.Managers {
 		managers[i] = createManager(cfg, mgrcfg, stop)
 	}
 	for _, mgr := range managers {
 		mgr := mgr
+		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			mgr.loop()
 		}()
 	}
+	if cfg.EnableJobs {
+		jp := newJobProcessor(cfg, managers)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			jp.loop(stop)
+		}()
+	}
 
-	<-stop
 	wg.Wait()
 
 	select {
@@ -143,9 +166,9 @@ func main() {
 
 func loadConfig(filename string) (*Config, error) {
 	cfg := &Config{
-		Syzkaller_Repo:   "https://github.com/google/syzkaller.git",
-		Syzkaller_Branch: "master",
-		Goroot:           os.Getenv("GOROOT"),
+		SyzkallerRepo:   "https://github.com/google/syzkaller.git",
+		SyzkallerBranch: "master",
+		Goroot:          os.Getenv("GOROOT"),
 	}
 	if err := config.LoadFile(filename, cfg); err != nil {
 		return nil, err
@@ -153,7 +176,7 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.Name == "" {
 		return nil, fmt.Errorf("param 'name' is empty")
 	}
-	if cfg.Http == "" {
+	if cfg.HTTP == "" {
 		return nil, fmt.Errorf("param 'http' is empty")
 	}
 	if len(cfg.Managers) == 0 {
@@ -164,7 +187,7 @@ func loadConfig(filename string) (*Config, error) {
 			return nil, fmt.Errorf("param 'managers[%v].name' is empty", i)
 		}
 		mgrcfg := new(mgrconfig.Config)
-		if err := config.LoadData(mgr.Manager_Config, mgrcfg); err != nil {
+		if err := config.LoadData(mgr.ManagerConfig, mgrcfg); err != nil {
 			return nil, fmt.Errorf("manager %v: %v", mgr.Name, err)
 		}
 	}

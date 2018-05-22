@@ -76,9 +76,6 @@ func ctor(env *vmimpl.Env) (vmimpl.Pool, error) {
 	if cfg.Hub_Port == 0 {
 		return nil, fmt.Errorf("config param hub_port is empty")
 	}
-	if !osutil.IsExist(env.Sshkey) {
-		return nil, fmt.Errorf("ssh key '%v' does not exist", env.Sshkey)
-	}
 	if !osutil.IxExist(cfg.Console) {
 		return nil, fmt.Errorf("console file '%v' does not exist", cfg.Console)
 	}
@@ -138,7 +135,7 @@ func (inst *instance) ssh(command string) ([]byte, error) {
 	if inst.debug {
 		Logf(0, "running command: ssh %#v", args)
 	}
-	cmd := exec.Command("ssh", args...)
+	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil {
@@ -297,7 +294,7 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	basePath := "/data/"
 	vmDst := filepath.Join(basePath, filepath.Base(hostSrc))
 	args := append(inst.sshArgs("-P"), hostSrc, "root@"+inst.cfg.Slave_Addr+":"+vmDst)
-	cmd := exec.Command("scp", args...)
+	cmd := osutil.Command("scp", args...)
 	if inst.debug {
 		Logf(0, "running command: scp %#v", args)
 		cmd.Stdout = os.Stdout
@@ -322,7 +319,8 @@ func (inst *instance) Copy(hostSrc string) (string, error) {
 	return vmDst, nil
 }
 
-func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (<-chan []byte, <-chan error, error) {
+func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command string) (
+	<-chan []byte, <-chan error, error) {
 	tty, err := vmimpl.OpenConsole(inst.cfg.Console)
 	if err != nil {
 		return nil, nil, err
@@ -338,7 +336,7 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	if inst.debug {
 		Logf(0, "running command: ssh %#v", args)
 	}
-	cmd := exec.Command("ssh", args...)
+	cmd := osutil.Command("ssh", args...)
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil {
@@ -398,7 +396,6 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 
 func (inst *instance) sshArgs(portArg string) []string {
 	args := []string{
-		"-i", inst.sshkey,
 		portArg, "22",
 		"-F", "/dev/null",
 		"-o", "ConnectionAttempts=10",
@@ -408,6 +405,9 @@ func (inst *instance) sshArgs(portArg string) []string {
 		"-o", "IdentitiesOnly=yes",
 		"-o", "StrictHostKeyChecking=no",
 		"-o", "LogLevel=error",
+	}
+	if inst.sshkey != "" {
+		args = append(args, "-i", inst.sshkey)
 	}
 	if inst.debug {
 		args = append(args, "-v")

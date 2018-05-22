@@ -10,8 +10,9 @@ import (
 var debug = false // enabled in tests
 
 type validCtx struct {
-	args map[Arg]bool
-	uses map[Arg]Arg
+	target *Target
+	args   map[Arg]bool
+	uses   map[Arg]Arg
 }
 
 func (p *Prog) Validate() error {
@@ -19,10 +20,17 @@ func (p *Prog) Validate() error {
 }
 
 func (p *Prog) validate() error {
-	ctx := &validCtx{make(map[Arg]bool), make(map[Arg]Arg)}
+	ctx := &validCtx{
+		target: p.Target,
+		args:   make(map[Arg]bool),
+		uses:   make(map[Arg]Arg),
+	}
 	for _, c := range p.Calls {
-		if err := c.validate(ctx); err != nil {
-			return err
+		if c.Meta == nil {
+			return fmt.Errorf("call does not have meta information")
+		}
+		if err := ctx.validateCall(c); err != nil {
+			return fmt.Errorf("call %v: %v", c.Meta.Name, err)
 		}
 	}
 	for u, orig := range ctx.uses {
@@ -33,253 +41,213 @@ func (p *Prog) validate() error {
 	return nil
 }
 
-func (c *Call) validate(ctx *validCtx) error {
-	if c.Meta == nil {
-		return fmt.Errorf("call does not have meta information")
-	}
+func (ctx *validCtx) validateCall(c *Call) error {
 	if len(c.Args) != len(c.Meta.Args) {
-		return fmt.Errorf("syscall %v: wrong number of arguments, want %v, got %v", c.Meta.Name, len(c.Meta.Args), len(c.Args))
+		return fmt.Errorf("wrong number of arguments, want %v, got %v",
+			len(c.Meta.Args), len(c.Args))
 	}
-	var checkArg func(arg Arg) error
-	checkArg = func(arg Arg) error {
-		if arg == nil {
-			return fmt.Errorf("syscall %v: nil arg", c.Meta.Name)
+	for _, arg := range c.Args {
+		if err := ctx.validateArg(arg); err != nil {
+			return err
 		}
-		if ctx.args[arg] {
-			return fmt.Errorf("syscall %v: arg is referenced several times in the tree", c.Meta.Name)
-		}
+	}
+	return ctx.validateRet(c)
+}
 
-		ctx.args[arg] = true
-
-		if used, ok := arg.(ArgUsed); ok {
-			for u := range *used.Used() {
-				if u == nil {
-					return fmt.Errorf("syscall %v: nil reference in uses for arg %+v", c.Meta.Name, arg)
-				}
-				ctx.uses[u] = arg
-			}
-
-		}
-		if arg.Type() == nil {
-			return fmt.Errorf("syscall %v: no type", c.Meta.Name)
-		}
-		if arg.Type().Dir() == DirOut {
-			switch a := arg.(type) {
-			case *ConstArg:
-				// We generate output len arguments, which makes sense since it can be
-				// a length of a variable-length array which is not known otherwise.
-				if _, ok := a.Type().(*LenType); ok {
-					break
-				}
-				if a.Val != 0 && a.Val != a.Type().Default() {
-					return fmt.Errorf("syscall %v: output arg '%v'/'%v' has non default value '%+v'", c.Meta.Name, a.Type().FieldName(), a.Type().Name(), a)
-				}
-			case *DataArg:
-				for _, v := range a.Data {
-					if v != 0 {
-						return fmt.Errorf("syscall %v: output arg '%v' has data", c.Meta.Name, a.Type().Name())
-					}
-				}
-			}
-		}
-		switch typ1 := arg.Type().(type) {
-		case *IntType:
-			switch a := arg.(type) {
-			case *ConstArg:
-				if a.Type().Dir() == DirOut && (a.Val != 0 && a.Val != a.Type().Default()) {
-					return fmt.Errorf("syscall %v: out int arg '%v' has bad const value %v", c.Meta.Name, a.Type().Name(), a.Val)
-				}
-			case *ReturnArg:
-			default:
-				return fmt.Errorf("syscall %v: int arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *ResourceType:
-			switch a := arg.(type) {
-			case *ResultArg:
-				if a.Type().Dir() == DirOut && (a.Val != 0 && a.Val != a.Type().Default()) {
-					return fmt.Errorf("syscall %v: out resource arg '%v' has bad const value %v", c.Meta.Name, a.Type().Name(), a.Val)
-				}
-			case *ReturnArg:
-			case *ConstArg:
-				return fmt.Errorf("syscall %v: fd arg '%v' has bad kind ConstantArg %v", c.Meta.Name, arg.Type().Name(), arg)
-			default:
-				return fmt.Errorf("syscall %v: fd arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *StructType, *ArrayType:
-			switch arg.(type) {
-			case *GroupArg:
-			default:
-				return fmt.Errorf("syscall %v: struct/array arg '%v' has bad kind %#v",
-					c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *UnionType:
-			switch arg.(type) {
-			case *UnionArg:
-			case *GroupArg:
-				return fmt.Errorf("syscall %v: union arg '%v' instead has a group kind %v %s", c.Meta.Name, arg.Type().Name(), arg)
-			default:
-				return fmt.Errorf("syscall %v: union arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *ProcType:
-			switch a := arg.(type) {
-			case *ConstArg:
-				if a.Val >= typ1.ValuesPerProc {
-					return fmt.Errorf("syscall %v: per proc arg '%v' has bad value '%v'", c.Meta.Name, a.Type().Name(), a.Val)
-				}
-			default:
-				return fmt.Errorf("syscall %v: proc arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *BufferType:
-			switch a := arg.(type) {
-			case *DataArg:
-				switch typ1.Kind {
-				case BufferString:
-					if typ1.TypeSize != 0 && uint64(len(a.Data)) != typ1.TypeSize {
-						return fmt.Errorf("syscall %v: string arg '%v' has size %v, which should be %v",
-							c.Meta.Name, a.Type().Name(), len(a.Data), typ1.TypeSize)
-					}
-				}
-			default:
-				return fmt.Errorf("syscall %v: buffer arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *CsumType:
-			switch a := arg.(type) {
-			case *ConstArg:
-				if a.Val != 0 {
-					return fmt.Errorf("syscall %v: csum arg '%v' has nonzero value %v", c.Meta.Name, a.Type().Name(), a.Val)
-				}
-			default:
-				return fmt.Errorf("syscall %v: csum arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		case *PtrType:
-			switch a := arg.(type) {
-			case *PointerArg:
-				if a.Type().Dir() == DirOut {
-					return fmt.Errorf("syscall %v: pointer arg '%v' has output direction", c.Meta.Name, a.Type().Name())
-				}
-				if a.Res == nil && !a.Type().Optional() {
-					return fmt.Errorf("syscall %v: non optional pointer arg '%v' is nil", c.Meta.Name, a.Type().Name())
-				}
-			default:
-				return fmt.Errorf("syscall %v: ptr arg '%v' has bad kind %v", c.Meta.Name, arg.Type().Name(), arg)
-			}
-		}
-		switch a := arg.(type) {
-		case *ConstArg:
-		case *PointerArg:
-			switch t := a.Type().(type) {
-			case *VmaType:
-				if a.Res != nil {
-					return fmt.Errorf("syscall %v: vma arg '%v' has data", c.Meta.Name, a.Type().Name())
-				}
-				if a.PagesNum == 0 && t.Dir() != DirOut && !t.Optional() {
-					return fmt.Errorf("syscall %v: vma arg '%v' has size 0", c.Meta.Name, a.Type().Name())
-				}
-			case *PtrType:
-				if a.Res != nil {
-					if err := checkArg(a.Res); err != nil {
-						return err
-					}
-				}
-				if a.PagesNum != 0 {
-					return fmt.Errorf("syscall %v: pointer arg '%v' has nonzero size", c.Meta.Name, a.Type().Name())
-				}
-			default:
-				return fmt.Errorf("syscall %v: pointer arg '%v' has bad meta type %+v", c.Meta.Name, arg.Type().Name(), arg.Type())
-			}
-		case *DataArg:
-			switch typ1 := a.Type().(type) {
-			case *ArrayType:
-				if typ2, ok := typ1.Type.(*IntType); !ok || typ2.Size() != 1 {
-					return fmt.Errorf("syscall %v: data arg '%v' should be an array", c.Meta.Name, a.Type().Name())
-				}
-			}
-		case *GroupArg:
-			switch typ1 := a.Type().(type) {
-			case *StructType:
-				if len(a.Inner) != len(typ1.Fields) {
-					return fmt.Errorf("syscall %v: struct arg '%v' has wrong number of fields: want %v, got %v", c.Meta.Name, a.Type().Name(), len(typ1.Fields), len(a.Inner))
-				}
-				for _, arg1 := range a.Inner {
-					if err := checkArg(arg1); err != nil {
-						return err
-					}
-				}
-			case *ArrayType:
-				for _, arg1 := range a.Inner {
-					if err := checkArg(arg1); err != nil {
-						return err
-					}
-				}
-			default:
-				return fmt.Errorf("syscall %v: group arg '%v' has bad underlying type %+v", c.Meta.Name, arg.Type().Name(), arg.Type())
-			}
-		case *UnionArg:
-			typ1, ok := a.Type().(*UnionType)
-			if !ok {
-				return fmt.Errorf("syscall %v: union arg '%v' has bad type", c.Meta.Name, a.Type().Name())
-			}
-			found := false
-			for _, typ2 := range typ1.Fields {
-				if a.OptionType.Name() == typ2.Name() {
-					found = true
-					break
-				}
-			}
-			if !found {
-				return fmt.Errorf("syscall %v: union arg '%v' has bad option", c.Meta.Name, a.Type().Name())
-			}
-			if err := checkArg(a.Option); err != nil {
-				return err
-			}
-		case *ResultArg:
-			switch a.Type().(type) {
-			case *ResourceType:
-			default:
-				return fmt.Errorf("syscall %v: result arg '%v' has bad meta type %+v", c.Meta.Name, arg.Type().Name(), arg.Type())
-			}
-			if a.Res == nil {
-				break
-			}
-			if !ctx.args[a.Res] {
-				return fmt.Errorf("syscall %v: result arg '%v' references out-of-tree result: %p%+v -> %p%+v",
-					c.Meta.Name, a.Type().Name(), arg, arg, a.Res, a.Res)
-			}
-			if _, ok := (*a.Res.(ArgUsed).Used())[arg]; !ok {
-				return fmt.Errorf("syscall %v: result arg '%v' has broken link (%+v)", c.Meta.Name, a.Type().Name(), *a.Res.(ArgUsed).Used())
-			}
-		case *ReturnArg:
-			switch a.Type().(type) {
-			case *ResourceType:
-			case *VmaType:
-			default:
-				return fmt.Errorf("syscall %v: result arg '%v' has bad meta type %+v", c.Meta.Name, arg.Type().Name(), arg.Type())
-			}
-		default:
-			return fmt.Errorf("syscall %v: unknown arg '%v' kind", c.Meta.Name, arg.Type().Name())
+func (ctx *validCtx) validateRet(c *Call) error {
+	if c.Meta.Ret == nil {
+		if c.Ret != nil {
+			return fmt.Errorf("return value without type")
 		}
 		return nil
 	}
-	for _, arg := range c.Args {
-		if _, ok := arg.(*ReturnArg); ok {
-			return fmt.Errorf("syscall %v: arg '%v' has wrong return kind", c.Meta.Name, arg.Type().Name())
-		}
-		if err := checkArg(arg); err != nil {
-			return err
-		}
-	}
 	if c.Ret == nil {
-		return fmt.Errorf("syscall %v: return value is absent", c.Meta.Name)
+		return fmt.Errorf("return value is absent")
 	}
-	if _, ok := c.Ret.(*ReturnArg); !ok {
-		return fmt.Errorf("syscall %v: return value has wrong kind %v", c.Meta.Name, c.Ret)
+	if c.Ret.Type() != c.Meta.Ret {
+		return fmt.Errorf("wrong return type: %#v vs %#v", c.Ret.Type(), c.Meta.Ret)
 	}
-	if c.Meta.Ret != nil {
-		if err := checkArg(c.Ret); err != nil {
+	if c.Ret.Type().Dir() != DirOut {
+		return fmt.Errorf("return value %v is not output", c.Ret)
+	}
+	if c.Ret.Res != nil || c.Ret.Val != 0 || c.Ret.OpDiv != 0 || c.Ret.OpAdd != 0 {
+		return fmt.Errorf("return value %v is not empty", c.Ret)
+	}
+	return ctx.validateArg(c.Ret)
+}
+
+func (ctx *validCtx) validateArg(arg Arg) error {
+	if arg == nil {
+		return fmt.Errorf("nil arg")
+	}
+	if ctx.args[arg] {
+		return fmt.Errorf("arg %#v is referenced several times in the tree", arg)
+	}
+	if arg.Type() == nil {
+		return fmt.Errorf("no arg type")
+	}
+	ctx.args[arg] = true
+	return arg.validate(ctx)
+}
+
+func (arg *ConstArg) validate(ctx *validCtx) error {
+	switch typ := arg.Type().(type) {
+	case *IntType:
+		if typ.Dir() == DirOut && (arg.Val != 0 && arg.Val != typ.Default()) {
+			return fmt.Errorf("out int arg '%v' has bad const value %v", typ.Name(), arg.Val)
+		}
+	case *ProcType:
+		if arg.Val >= typ.ValuesPerProc && arg.Val != typ.Default() {
+			return fmt.Errorf("per proc arg '%v' has bad value %v", typ.Name(), arg.Val)
+		}
+	case *CsumType:
+		if arg.Val != 0 {
+			return fmt.Errorf("csum arg '%v' has nonzero value %v", typ.Name(), arg.Val)
+		}
+	case *ConstType:
+	case *FlagsType:
+	case *LenType:
+	default:
+		return fmt.Errorf("const arg %v has bad type %v", arg, typ.Name())
+	}
+	if typ := arg.Type(); typ.Dir() == DirOut {
+		// We generate output len arguments, which makes sense since it can be
+		// a length of a variable-length array which is not known otherwise.
+		if _, isLen := typ.(*LenType); !isLen {
+			if arg.Val != 0 && arg.Val != typ.Default() {
+				return fmt.Errorf("output arg '%v'/'%v' has non default value '%+v'",
+					typ.FieldName(), typ.Name(), arg)
+			}
+		}
+	}
+	return nil
+}
+
+func (arg *ResultArg) validate(ctx *validCtx) error {
+	typ, ok := arg.Type().(*ResourceType)
+	if !ok {
+		return fmt.Errorf("result arg %v has bad type %v", arg, arg.Type().Name())
+	}
+	for u := range arg.uses {
+		if u == nil {
+			return fmt.Errorf("nil reference in uses for arg %+v", arg)
+		}
+		ctx.uses[u] = arg
+	}
+	if typ.Dir() == DirOut && (arg.Val != 0 && arg.Val != typ.Default()) {
+		return fmt.Errorf("out resource arg '%v' has bad const value %v", typ.Name(), arg.Val)
+	}
+	if arg.Res != nil {
+		if !ctx.args[arg.Res] {
+			return fmt.Errorf("result arg %v references out-of-tree result: %#v -> %#v",
+				typ.Name(), arg, arg.Res)
+		}
+		if !arg.Res.uses[arg] {
+			return fmt.Errorf("result arg '%v' has broken link (%+v)", typ.Name(), arg.Res.uses)
+		}
+	}
+	return nil
+}
+
+func (arg *DataArg) validate(ctx *validCtx) error {
+	typ, ok := arg.Type().(*BufferType)
+	if !ok {
+		return fmt.Errorf("data arg %v has bad type %v", arg, arg.Type().Name())
+	}
+	if typ.Dir() == DirOut && len(arg.data) != 0 {
+		return fmt.Errorf("output arg '%v' has data", typ.Name())
+	}
+	if !typ.Varlen() && typ.Size() != arg.Size() {
+		return fmt.Errorf("data arg %v has wrong size %v, want %v",
+			typ.Name(), arg.Size(), typ.Size())
+	}
+	switch typ.Kind {
+	case BufferString:
+		if typ.TypeSize != 0 && arg.Size() != typ.TypeSize {
+			return fmt.Errorf("string arg '%v' has size %v, which should be %v",
+				typ.Name(), arg.Size(), typ.TypeSize)
+		}
+	}
+	return nil
+}
+
+func (arg *GroupArg) validate(ctx *validCtx) error {
+	switch typ := arg.Type().(type) {
+	case *StructType:
+		if len(arg.Inner) != len(typ.Fields) {
+			return fmt.Errorf("struct arg '%v' has wrong number of fields: want %v, got %v",
+				typ.Name(), len(typ.Fields), len(arg.Inner))
+		}
+	case *ArrayType:
+		if typ.Kind == ArrayRangeLen && typ.RangeBegin == typ.RangeEnd &&
+			uint64(len(arg.Inner)) != typ.RangeBegin {
+			return fmt.Errorf("array %v has wrong number of elements %v, want %v",
+				typ.Name(), len(arg.Inner), typ.RangeBegin)
+		}
+	default:
+		return fmt.Errorf("group arg %v has bad type %v", arg, typ.Name())
+	}
+	for _, arg1 := range arg.Inner {
+		if err := ctx.validateArg(arg1); err != nil {
 			return err
 		}
-	} else if c.Ret.Type() != nil {
-		return fmt.Errorf("syscall %v: return value has spurious type: %+v", c.Meta.Name, c.Ret.Type())
+	}
+	return nil
+}
+
+func (arg *UnionArg) validate(ctx *validCtx) error {
+	typ, ok := arg.Type().(*UnionType)
+	if !ok {
+		return fmt.Errorf("union arg %v has bad type %v", arg, arg.Type().Name())
+	}
+	found := false
+	for _, typ1 := range typ.Fields {
+		if arg.Option.Type().Name() == typ1.Name() {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("union arg '%v' has bad option", typ.Name())
+	}
+	return ctx.validateArg(arg.Option)
+}
+
+func (arg *PointerArg) validate(ctx *validCtx) error {
+	maxMem := ctx.target.NumPages * ctx.target.PageSize
+	size := arg.VmaSize
+	if size == 0 && arg.Res != nil {
+		size = arg.Res.Size()
+	}
+	if arg.Address >= maxMem || arg.Address+size > maxMem {
+		return fmt.Errorf("ptr %v has bad address %v/%v/%v",
+			arg.Type().Name(), arg.Address, arg.VmaSize, size)
+	}
+	switch typ := arg.Type().(type) {
+	case *VmaType:
+		if arg.Res != nil {
+			return fmt.Errorf("vma arg '%v' has data", typ.Name())
+		}
+		if arg.VmaSize == 0 && typ.Dir() != DirOut && !typ.Optional() {
+			return fmt.Errorf("vma arg '%v' has size 0", typ.Name())
+		}
+	case *PtrType:
+		if arg.Res == nil && !arg.Type().Optional() {
+			return fmt.Errorf("non optional pointer arg '%v' is nil", typ.Name())
+		}
+		if arg.Res != nil {
+			if err := ctx.validateArg(arg.Res); err != nil {
+				return err
+			}
+		}
+		if arg.VmaSize != 0 {
+			return fmt.Errorf("pointer arg '%v' has nonzero size", typ.Name())
+		}
+		if typ.Dir() == DirOut {
+			return fmt.Errorf("pointer arg '%v' has output direction", typ.Name())
+		}
+	default:
+		return fmt.Errorf("ptr arg %v has bad type %v", arg, typ.Name())
 	}
 	return nil
 }

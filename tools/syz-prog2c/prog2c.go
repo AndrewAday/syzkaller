@@ -16,6 +16,7 @@ import (
 )
 
 var (
+	flagOS         = flag.String("os", runtime.GOOS, "target os")
 	flagArch       = flag.String("arch", runtime.GOARCH, "target arch")
 	flagThreaded   = flag.Bool("threaded", false, "create threaded program")
 	flagCollide    = flag.Bool("collide", false, "create collide program")
@@ -27,6 +28,9 @@ var (
 	flagFaultNth   = flag.Int("fault_nth", 0, "inject fault on n-th operation (0-based)")
 	flagEnableTun  = flag.Bool("tun", false, "set up TUN/TAP interface")
 	flagUseTmpDir  = flag.Bool("tmpdir", false, "create a temporary dir and execute inside it")
+	flagCgroups    = flag.Bool("cgroups", false, "enable cgroups support")
+	flagNetdev     = flag.Bool("netdev", false, "setup various net devices")
+	flagResetNet   = flag.Bool("resetnet", false, "reset net namespace after each test")
 	flagHandleSegv = flag.Bool("segv", false, "catch and ignore SIGSEGV")
 	flagWaitRepeat = flag.Bool("waitrepeat", false, "wait for each repeat attempt")
 	flagDebug      = flag.Bool("debug", false, "generate debug printfs")
@@ -38,7 +42,7 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	target, err := prog.GetTarget(runtime.GOOS, *flagArch)
+	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v", err)
 		os.Exit(1)
@@ -54,20 +58,23 @@ func main() {
 		os.Exit(1)
 	}
 	opts := csource.Options{
-		Threaded:   *flagThreaded,
-		Collide:    *flagCollide,
-		Repeat:     *flagRepeat,
-		Procs:      *flagProcs,
-		Sandbox:    *flagSandbox,
-		Fault:      *flagFaultCall >= 0,
-		FaultCall:  *flagFaultCall,
-		FaultNth:   *flagFaultNth,
-		EnableTun:  *flagEnableTun,
-		UseTmpDir:  *flagUseTmpDir,
-		HandleSegv: *flagHandleSegv,
-		WaitRepeat: *flagWaitRepeat,
-		Debug:      *flagDebug,
-		Repro:      false,
+		Threaded:      *flagThreaded,
+		Collide:       *flagCollide,
+		Repeat:        *flagRepeat,
+		Procs:         *flagProcs,
+		Sandbox:       *flagSandbox,
+		Fault:         *flagFaultCall >= 0,
+		FaultCall:     *flagFaultCall,
+		FaultNth:      *flagFaultNth,
+		EnableTun:     *flagEnableTun,
+		UseTmpDir:     *flagUseTmpDir,
+		EnableCgroups: *flagCgroups,
+		EnableNetdev:  *flagNetdev,
+		ResetNet:      *flagResetNet,
+		HandleSegv:    *flagHandleSegv,
+		WaitRepeat:    *flagWaitRepeat,
+		Debug:         *flagDebug,
+		Repro:         false,
 	}
 	src, err := csource.Write(p, opts)
 	if err != nil {

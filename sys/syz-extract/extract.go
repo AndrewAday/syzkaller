@@ -11,13 +11,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 
 	"github.com/google/syzkaller/pkg/ast"
 	"github.com/google/syzkaller/pkg/compiler"
@@ -40,13 +37,17 @@ type Arch struct {
 	build     bool
 	files     []*File
 	err       error
+	done      chan bool
 }
 
 type File struct {
 	arch       *Arch
 	name       string
+	consts     map[string]uint64
 	undeclared map[string]bool
+	info       *compiler.ConstInfo
 	err        error
+	done       chan bool
 }
 
 type OS interface {
@@ -56,7 +57,10 @@ type OS interface {
 }
 
 var oses = map[string]OS{
+	"akaros":  new(akaros),
 	"linux":   new(linux),
+	"freebsd": new(freebsd),
+	"netbsd":  new(netbsd),
 	"android": new(linux),
 	"fuchsia": new(fuchsia),
 	"windows": new(windows),
@@ -68,57 +72,24 @@ func main() {
 		os.Exit(1)
 	}
 	flag.Parse()
-
-	OS := oses[*flagOS]
-	if OS == nil {
-		failf("unknown os: %v", *flagOS)
-	}
 	if *flagBuild && *flagBuildDir != "" {
 		failf("-build and -builddir is an invalid combination")
 	}
-	android := false
-	if *flagOS == "android" {
-		android = true
-		*flagOS = "linux"
-	}
-	var archArray []string
-	if *flagArch != "" {
-		archArray = strings.Split(*flagArch, ",")
-	} else {
-		for arch := range targets.List[*flagOS] {
-			archArray = append(archArray, arch)
-		}
-		if android {
-			archArray = []string{"amd64", "arm64"}
-		}
-		sort.Strings(archArray)
-	}
-	files := flag.Args()
-	if len(files) == 0 {
-		matches, err := filepath.Glob(filepath.Join("sys", *flagOS, "*.txt"))
-		if err != nil || len(matches) == 0 {
-			failf("failed to find sys files: %v", err)
-		}
-		androidFiles := map[string]bool{
-			"ion.txt":        true,
-			"tlk_device.txt": true,
-		}
-		for _, f := range matches {
-			f = filepath.Base(f)
-			if *flagOS == "linux" && android != androidFiles[f] {
-				continue
-			}
-			files = append(files, filepath.Base(f))
-		}
-		sort.Strings(files)
+
+	osStr, archArray, files, err := archFileList(*flagOS, *flagArch, flag.Args())
+	if err != nil {
+		failf("%v", err)
 	}
 
+	OS := oses[osStr]
+	if OS == nil {
+		failf("unknown os: %v", osStr)
+	}
 	if err := OS.prepare(*flagSourceDir, *flagBuild, archArray); err != nil {
 		failf("%v", err)
 	}
 
 	jobC := make(chan interface{}, len(archArray)*len(files))
-	var wg sync.WaitGroup
 
 	var arches []*Arch
 	for _, archStr := range archArray {
@@ -135,7 +106,7 @@ func main() {
 			buildDir = *flagSourceDir
 		}
 
-		target := targets.List[*flagOS][archStr]
+		target := targets.List[osStr][archStr]
 		if target == nil {
 			failf("unknown arch: %v", archStr)
 		}
@@ -145,16 +116,17 @@ func main() {
 			sourceDir: *flagSourceDir,
 			buildDir:  buildDir,
 			build:     *flagBuild,
+			done:      make(chan bool),
 		}
 		for _, f := range files {
 			arch.files = append(arch.files, &File{
 				arch: arch,
 				name: f,
+				done: make(chan bool),
 			})
 		}
 		arches = append(arches, arch)
 		jobC <- arch
-		wg.Add(1)
 	}
 
 	for p := 0; p < runtime.GOMAXPROCS(0); p++ {
@@ -162,107 +134,154 @@ func main() {
 			for job := range jobC {
 				switch j := job.(type) {
 				case *Arch:
-					j.err = OS.prepareArch(j)
+					infos, err := processArch(OS, j)
+					j.err = err
+					close(j.done)
 					if j.err == nil {
 						for _, f := range j.files {
-							wg.Add(1)
+							f.info = infos[f.name]
 							jobC <- f
 						}
 					}
 				case *File:
-					j.undeclared, j.err = processFile(OS, j.arch, j.name)
+					j.consts, j.undeclared, j.err = processFile(OS, j.arch, j)
+					close(j.done)
 				}
-				wg.Done()
 			}
 		}()
 	}
-	wg.Wait()
+
+	failed := false
+	for _, arch := range arches {
+		fmt.Printf("generating %v/%v...\n", arch.target.OS, arch.target.Arch)
+		<-arch.done
+		if arch.err != nil {
+			failed = true
+			fmt.Printf("	%v\n", arch.err)
+			continue
+		}
+		for _, f := range arch.files {
+			fmt.Printf("extracting from %v\n", f.name)
+			<-f.done
+			if f.err != nil {
+				failed = true
+				fmt.Printf("	%v\n", f.err)
+				continue
+			}
+		}
+		fmt.Printf("\n")
+	}
+
+	if !failed {
+		supported := make(map[string]bool)
+		unsupported := make(map[string]string)
+		for _, arch := range arches {
+			for _, f := range arch.files {
+				for name := range f.consts {
+					supported[name] = true
+				}
+				for name := range f.undeclared {
+					unsupported[name] = f.name
+				}
+			}
+		}
+		for name, file := range unsupported {
+			if supported[name] {
+				continue
+			}
+			failed = true
+			fmt.Printf("%v: %v is unsupported on all arches (typo?)\n",
+				file, name)
+		}
+	}
 
 	for _, arch := range arches {
 		if arch.build {
 			os.RemoveAll(arch.buildDir)
 		}
 	}
-
-	for _, arch := range arches {
-		fmt.Printf("generating %v/%v...\n", arch.target.OS, arch.target.Arch)
-		if arch.err != nil {
-			failf("%v", arch.err)
-		}
-		for _, f := range arch.files {
-			fmt.Printf("extracting from %v\n", f.name)
-			if f.err != nil {
-				failf("%v", f.err)
-			}
-			for c := range f.undeclared {
-				fmt.Printf("undefined const: %v\n", c)
-			}
-		}
-		fmt.Printf("\n")
+	if failed {
+		os.Exit(1)
 	}
 }
 
-func processFile(OS OS, arch *Arch, inname string) (map[string]bool, error) {
-	inname = filepath.Join("sys", arch.target.OS, inname)
-	outname := strings.TrimSuffix(inname, ".txt") + "_" + arch.target.Arch + ".const"
-	indata, err := ioutil.ReadFile(inname)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read input file: %v", err)
+func archFileList(os, arch string, files []string) (string, []string, []string, error) {
+	android := false
+	if os == "android" {
+		android = true
+		os = "linux"
 	}
+	var arches []string
+	if arch != "" {
+		arches = strings.Split(arch, ",")
+	} else {
+		for arch := range targets.List[os] {
+			arches = append(arches, arch)
+		}
+		if android {
+			arches = []string{"386", "amd64", "arm", "arm64"}
+		}
+		sort.Strings(arches)
+	}
+	if len(files) == 0 {
+		matches, err := filepath.Glob(filepath.Join("sys", os, "*.txt"))
+		if err != nil || len(matches) == 0 {
+			return "", nil, nil, fmt.Errorf("failed to find sys files: %v", err)
+		}
+		androidFiles := map[string]bool{
+			"tlk_device.txt": true,
+			// This was generated on:
+			// https://source.codeaurora.org/quic/la/kernel/msm-4.9 msm-4.9
+			"video4linux.txt": true,
+		}
+		for _, f := range matches {
+			f = filepath.Base(f)
+			if os == "linux" && android != androidFiles[f] {
+				continue
+			}
+			files = append(files, f)
+		}
+		sort.Strings(files)
+	}
+	return os, arches, files, nil
+}
+
+func processArch(OS OS, arch *Arch) (map[string]*compiler.ConstInfo, error) {
 	errBuf := new(bytes.Buffer)
 	eh := func(pos ast.Pos, msg string) {
 		fmt.Fprintf(errBuf, "%v: %v\n", pos, msg)
 	}
-	desc := ast.Parse(indata, filepath.Base(inname), eh)
-	if desc == nil {
+	top := ast.ParseGlob(filepath.Join("sys", arch.target.OS, "*.txt"), eh)
+	if top == nil {
 		return nil, fmt.Errorf("%v", errBuf.String())
 	}
-	info := compiler.ExtractConsts(desc, arch.target, eh)
-	if info == nil {
+	infos := compiler.ExtractConsts(top, arch.target, eh)
+	if infos == nil {
 		return nil, fmt.Errorf("%v", errBuf.String())
 	}
-	if len(info.Consts) == 0 {
-		return nil, nil
-	}
-	consts, undeclared, err := OS.processFile(arch, info)
-	if err != nil {
+	if err := OS.prepareArch(arch); err != nil {
 		return nil, err
 	}
-	data := compiler.SerializeConsts(consts)
-	if err := osutil.WriteFile(outname, data); err != nil {
-		return nil, fmt.Errorf("failed to write output file: %v", err)
-	}
-	return undeclared, nil
+	return infos, nil
 }
 
-func runBinaryAndParse(bin string, vals []string, undeclared map[string]bool) (map[string]uint64, error) {
-	out, err := exec.Command(bin).CombinedOutput()
+func processFile(OS OS, arch *Arch, file *File) (map[string]uint64, map[string]bool, error) {
+	inname := filepath.Join("sys", arch.target.OS, file.name)
+	outname := strings.TrimSuffix(inname, ".txt") + "_" + arch.target.Arch + ".const"
+	if file.info == nil {
+		return nil, nil, fmt.Errorf("input file %v is missing", inname)
+	}
+	if len(file.info.Consts) == 0 {
+		os.Remove(outname)
+		return nil, nil, nil
+	}
+	consts, undeclared, err := OS.processFile(arch, file.info)
 	if err != nil {
-		return nil, fmt.Errorf("failed to run flags binary: %v\n%v", err, string(out))
+		return nil, nil, err
 	}
-	flagVals := strings.Split(string(out), " ")
-	if len(out) == 0 {
-		flagVals = nil
+	data := compiler.SerializeConsts(consts, undeclared)
+	if err := osutil.WriteFile(outname, data); err != nil {
+		return nil, nil, fmt.Errorf("failed to write output file: %v", err)
 	}
-	if len(flagVals) != len(vals)-len(undeclared) {
-		return nil, fmt.Errorf("fetched wrong number of values %v != %v - %v\nflagVals: %q\nvals: %q\nundeclared: %q",
-			len(flagVals), len(vals), len(undeclared),
-			flagVals, vals, undeclared)
-	}
-	res := make(map[string]uint64)
-	j := 0
-	for _, v := range flagVals {
-		name := vals[j]
-		j++
-		for undeclared[name] {
-			name = vals[j]
-			j++
-		}
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse value: %v (%v)", err, v)
-		}
-		res[name] = n
-	}
-	return res, nil
+	return consts, undeclared, nil
 }

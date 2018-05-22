@@ -10,7 +10,11 @@ package vmimpl
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os/exec"
 	"time"
+
+	"github.com/google/syzkaller/pkg/log"
 )
 
 // Pool represents a set of test machines (VMs, physical devices, etc) of particular type.
@@ -33,7 +37,7 @@ type Instance interface {
 
 	// Run runs cmd inside of the VM (think of ssh cmd).
 	// outc receives combined cmd and kernel console output.
-	// errc receives either command Wait return error or vmimpl.TimeoutErr.
+	// errc receives either command Wait return error or vmimpl.ErrTimeout.
 	// Command is terminated after timeout. Send on the stop chan can be used to terminate it earlier.
 	Run(timeout time.Duration, stop <-chan bool, command string) (outc <-chan []byte, errc <-chan error, err error)
 
@@ -50,10 +54,24 @@ type Env struct {
 	Arch    string // target arch
 	Workdir string
 	Image   string
-	SshKey  string
-	SshUser string
+	SSHKey  string
+	SSHUser string
 	Debug   bool
 	Config  []byte // json-serialized VM-type-specific config
+}
+
+// BootError is returned by Pool.Create when VM does not boot.
+type BootError struct {
+	Title  string
+	Output []byte
+}
+
+func (err BootError) Error() string {
+	return fmt.Sprintf("%v\n%s", err.Title, err.Output)
+}
+
+func (err BootError) BootError() (string, []byte) {
+	return err.Title, err.Output
 }
 
 // Create creates a VM type that can be used to create individual VMs.
@@ -73,9 +91,49 @@ func Register(typ string, ctor ctorFunc) {
 var (
 	// Close to interrupt all pending operations in all VMs.
 	Shutdown   = make(chan struct{})
-	TimeoutErr = errors.New("timeout")
+	ErrTimeout = errors.New("timeout")
 
 	ctors = make(map[string]ctorFunc)
 )
 
 type ctorFunc func(env *Env) (Pool, error)
+
+func Multiplex(cmd *exec.Cmd, merger *OutputMerger, console io.Closer, timeout time.Duration,
+	stop, closed <-chan bool, debug bool) (<-chan []byte, <-chan error, error) {
+	errc := make(chan error, 1)
+	signal := func(err error) {
+		select {
+		case errc <- err:
+		default:
+		}
+	}
+	go func() {
+		select {
+		case <-time.After(timeout):
+			signal(ErrTimeout)
+		case <-stop:
+			signal(ErrTimeout)
+		case <-closed:
+			if debug {
+				log.Logf(0, "instance closed")
+			}
+			signal(fmt.Errorf("instance closed"))
+		case err := <-merger.Err:
+			cmd.Process.Kill()
+			console.Close()
+			merger.Wait()
+			if cmdErr := cmd.Wait(); cmdErr == nil {
+				// If the command exited successfully, we got EOF error from merger.
+				// But in this case no error has happened and the EOF is expected.
+				err = nil
+			}
+			signal(err)
+			return
+		}
+		cmd.Process.Kill()
+		console.Close()
+		merger.Wait()
+		cmd.Wait()
+	}()
+	return merger.Output, errc, nil
+}

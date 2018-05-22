@@ -1,5 +1,8 @@
 # How syzkaller works
 
+Below is the generic descriptions of how syzkaller works.
+Check [this](linux/internals.md) for Linux kernel specific things.
+
 ## Overview
 
 The process structure for the syzkaller system is shown in the following diagram;
@@ -45,7 +48,7 @@ and up to 100 `logN` and `reportN` files, one pair per test machine crash:
      ...
 ```
 
-Descriptions are extracted using a set of [regular expressions](/report/report.go#L33).
+Descriptions are extracted using a set of [regular expressions](/pkg/report/report.go#L33).
 This set may need to be extended if you are using a different kernel architecture, or are just seeing a previously unseen kernel error messages.
 
 `logN` files contain raw `syzkaller` logs and include kernel console output as well as programs executed before the crash.

@@ -128,9 +128,8 @@ func ParseMprotect(mprotect *prog.Syscall, syscall *strace_types.Syscall, ctx *C
 		Ret: strace_types.ReturnArg(mprotect.Ret),
 	}
 
-	_, address := ParseAddr(pageSize, mprotect.Args[0], syscall.Args[0], ctx)
+	addrArg, address := ParseAddr(pageSize, mprotect.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
-	addrArg := prog.MakePointerArg(mprotect.Args[0], address/pageSize, 0, 1, nil)
 	lengthArg := prog.MakeConstArg(mprotect.Args[1], length)
 	protArg := ParseFlags(mprotect.Args[2], syscall.Args[2], ctx, false)
 	AddDependency(address, length, addrArg, ctx)
@@ -147,8 +146,7 @@ func ParseMunmap(munmap *prog.Syscall, syscall *strace_types.Syscall, ctx *Conte
 		Meta: munmap,
 		Ret: strace_types.ReturnArg(munmap.Ret),
 	}
-	_, address := ParseAddr(pageSize, munmap.Args[0], syscall.Args[0], ctx)
-	addrArg := prog.MakePointerArg(munmap.Args[0], address/pageSize, 0, 1, nil)
+	addrArg, address := ParseAddr(pageSize, munmap.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
 	lengthArg := prog.MakeConstArg(munmap.Args[1], length)
 	AddDependency(address, length, addrArg, ctx)
@@ -231,7 +229,7 @@ func ParseShmat(shmat *prog.Syscall, syscall *strace_types.Syscall, ctx *Context
 	}
 
 	if arg := ctx.Cache.Get(shmat.Args[0], syscall.Args[0]); arg != nil {
-		fd = strace_types.ResultArg(shmat.Args[0], arg, arg.Type().Default())
+		fd = strace_types.ResultArg(shmat.Args[0], arg.(*prog.ResultArg), arg.Type().Default())
 	} else {
 		switch a := syscall.Args[0].(type) {
 		case *strace_types.Expression:
@@ -242,12 +240,12 @@ func ParseShmat(shmat *prog.Syscall, syscall *strace_types.Syscall, ctx *Context
 		fd = strace_types.ResultArg(shmat.Args[0], nil, shmid)
 	}
 
-	_, address := ParseAddr(pageSize, shmat.Args[1], syscall.Args[1], ctx)
+	addrArg, address := ParseAddr(pageSize, shmat.Args[1], syscall.Args[1], ctx)
 	flags := ParseFlags(shmat.Args[2], syscall.Args[2], ctx, false)
 
 	call.Args = []prog.Arg{
 		fd,
-		prog.MakePointerArg(shmat.Args[1], address/pageSize, 0, 1, nil),
+		addrArg,
 		flags,
 	}
 	//Cache the mapped address since it is a resource type as well
@@ -265,19 +263,20 @@ func ParseShmat(shmat *prog.Syscall, syscall *strace_types.Syscall, ctx *Context
 
 
 func ParseAddr(length uint64, syzType prog.Type, straceType strace_types.Type,  ctx *Context) (prog.Arg, uint64){
+	defAddrStart := (ctx.Target.NumPages-2)*ctx.Target.PageSize
 	switch a := straceType.(type) {
 	case *strace_types.PointerType:
 		var addrStart uint64
 		if a.IsNull() {
 			//Anonymous MMAP
 			addrStart = uint64(ctx.CurrentStraceCall.Ret)
-			return prog.MakePointerArg(syzType, addrStart/pageSize, 0, length/pageSize, nil), addrStart
+			return prog.MakeVmaPointerArg(syzType, defAddrStart, length), addrStart
 		} else {
-			return prog.MakePointerArg(syzType, a.Address, 0, length/pageSize, nil), a.Address
+			return prog.MakeVmaPointerArg(syzType, defAddrStart, length), a.Address
 		}
 	case *strace_types.Expression:
 		addrStart := a.Eval(ctx.Target)
-		return prog.MakePointerArg(syzType, addrStart, 0, length/pageSize, nil), addrStart
+		return prog.MakeVmaPointerArg(syzType, defAddrStart, length), addrStart
 	default:
 		panic("Failed to parse mmap")
 	}
@@ -317,7 +316,7 @@ func ParseFlags(syzType prog.Type, straceType strace_types.Type, ctx *Context, m
 
 func ParseFd(syzType prog.Type, straceType strace_types.Type, ctx *Context) prog.Arg {
 	if arg := ctx.Cache.Get(syzType, straceType); arg != nil {
-		return prog.MakeResultArg(arg.Type(), arg, arg.Type().Default())
+		return prog.MakeResultArg(arg.Type(), arg.(*prog.ResultArg), arg.Type().Default())
 	}
 	switch a := straceType.(type) {
 	case *strace_types.Expression:

@@ -7,9 +7,9 @@ import (
 	"github.com/google/syzkaller/pkg/log"
 )
 
-func kmemleakInit() {
-	if *flagLeak {
-		log.Fatalf("leak checking is not supported on fuchsia")
+func kmemleakInit(enable bool) {
+	if enable {
+		log.Fatalf("leak checking is not supported on freebsd")
 	}
 }
 
@@ -17,5 +17,5 @@ func kmemleakScan(report bool) {
 }
 
 func checkCompsSupported() (kcov, comps bool) {
-	return false, false
+	return true, false
 }
