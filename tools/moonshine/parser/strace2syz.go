@@ -367,33 +367,6 @@ func IdentifySockaddrNetlinkUnion(ctx *Context) int {
 
 func Parse_BufferType(syzType *prog.BufferType, straceType strace_types.Type, ctx *Context) (prog.Arg, error) {
 	if syzType.Dir() == prog.DirOut {
-		/*
-		switch syzType.Kind {
-		case prog.BufferBlobRand:
-			fmt.Printf("Buffer Type Rand\n")
-			size := rand.Intn(256)
-			arg = prog.MakeOutDataArg(syzType, uint64(size))
-
-		case prog.BufferBlobRange:
-			fmt.Printf("Buffer Type Range: for call %s\n", ctx.CurrentStraceCall.CallName)
-			max := rand.Intn(int(syzType.RangeEnd)-int(syzType.RangeBegin)+1)
-			size := max + int(syzType.RangeBegin)
-			arg = prog.MakeOutDataArg(syzType, uint64(size))
-		case prog.BufferFilename, prog.BufferString:
-			switch a := straceType.(type) {
-			case *strace_types.BufferType:
-				fmt.Printf("Buffer Type: for call %s %d\n", ctx.CurrentStraceCall.CallName, uint64(len(a.Val)))
-				return prog.MakeOutDataArg(syzType, uint64(len(a.Val))), nil
-			case *strace_types.Field:
-				return Parse_BufferType(syzType, a.Val, ctx)
-			default:
-				Failf("Err filling out dirOut for buffer type. Strace type is not buffer type: %s\n", a.Name())
-			}
-		default:
-			panic(fmt.Sprintf("unexpected buffer type kind: %v. call %v arg %v", syzType.Kind, ctx.CurrentSyzCall, straceType))
-		}
-		return arg, nil
-		*/
 		switch a := straceType.(type) {
 		case *strace_types.BufferType:
 			return prog.MakeOutDataArg(syzType, uint64(len(a.Val))), nil
