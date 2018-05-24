@@ -49,6 +49,7 @@ func (lex *lexer) Lex(out *StraceSymType) int {
                     | '<... resuming'.' '.identifier.' '.identifier.' '.'...>';
         ipv4 = '\"'.digit{1,4}.'\.'.digit{1,4}.'\.'digit{1,4}.'\.'.digit{1,4}'\"';
         ipv6 = '\"'.':'.':'.'\"' | '\"'.':'.':'.digit.'\"';
+        mac = xdigit{2}.':'.xdigit{2}.':'.xdigit{2}.':'.xdigit{2}.':'.xdigit{2}.':'.xdigit{2};
         comment := |*
             ((any-"*\/"));
             "*\/" => {fgoto main;};
@@ -63,10 +64,11 @@ func (lex *lexer) Lex(out *StraceSymType) int {
             ipv6 => {out.data = string(lex.data[lex.ts+1:lex.te-1]); tok=IPV6; fbreak;};
             '\"'.[0-9a-zA-Z\/\\\*]*.'\"'.['.']* => {out.data = ParseString(string(lex.data[lex.ts+1:lex.te-1])); tok = STRING_LITERAL;fbreak;};
             nullptr => {tok = NULL; fbreak;};
-            (['_']+?upper+ . ['_'A-Z0-9]+)-nullptr => {out.data = string(lex.data[lex.ts:lex.te]); tok = FLAG;fbreak;};
+            (['_']+?upper+ . ['_'A-Z0-9]+)-nullptr => {out.data = string(lex.data[lex.ts:lex.te]); tok = FLAG; fbreak;};
             identifier => {out.data = string(lex.data[lex.ts:lex.te]); tok = IDENTIFIER;fbreak;};
             unfinished => {tok = UNFINISHED; fbreak;};
             resumed => {tok = RESUMED; fbreak;};
+            mac => {out.data = string(lex.data[lex.ts : lex.te]); tok = MAC; fbreak;};
             '=' => {tok = EQUALS;fbreak;};
             '==' => {tok = LEQUAL; fbreak;};
             '(' => {tok = LPAREN;fbreak;};

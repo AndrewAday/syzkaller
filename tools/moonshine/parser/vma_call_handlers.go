@@ -284,6 +284,12 @@ func ParseAddr(length uint64, syzType prog.Type, straceType strace_types.Type,  
 
 func AddDependency(start, length uint64, addr prog.Arg, ctx *Context) {
 	if mapping := ctx.State.Tracker.FindLatestOverlappingVMA(start); mapping != nil {
+		dependsOn := make(map[*prog.Call]int, 0)
+		dependsOn[mapping.GetCall()] = mapping.GetCallIdx()
+		for _, dep := range mapping.GetUsedBy() {
+			dependsOn[ctx.Prog.Calls[dep.Callidx]] = dep.Callidx
+		}
+		ctx.DependsOn[ctx.CurrentSyzCall] = dependsOn
 		dep := tracker.NewMemDependency(len(ctx.Prog.Calls), addr, start, start+length)
 		mapping.AddDependency(dep)
 	}

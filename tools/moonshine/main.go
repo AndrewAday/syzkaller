@@ -17,11 +17,14 @@ import (
 	. "github.com/google/syzkaller/tools/moonshine/logging"
 	"github.com/google/syzkaller/sys"
 	"path"
+	"github.com/google/syzkaller/tools/moonshine/tracker"
+	"github.com/google/syzkaller/tools/moonshine/distiller"
 )
 
 var (
 	flagFile = flag.String("file", "", "file to parse")
 	flagDir = flag.String("dir", "", "director to parse")
+	flagDistill = flag.String("distill", "", "distillation strategy")
 )
 
 const (
@@ -39,7 +42,7 @@ func main() {
 		Failf("error getting target: %v", err.Error())
 	} else {
 		fmt.Printf("Const Map len: %d\n", len(target.ConstMap))
-		ParseTraces(target, false)
+		ParseTraces(target)
 		pack("serialized", "corpus.db")
 	}
 }
@@ -52,15 +55,20 @@ func progIsTooLarge(prog_ *prog.Prog) bool {
 	return false
 }
 
-func ParseTraces(target *prog.Target, distill bool) []*prog.Prog {
-	ret := make([]*prog.Prog, 0)
+func ParseTraces(target *prog.Target) []*Context {
+	ret := make([]*Context, 0)
 	names := make([]string, 0)
+	distill := false
 	if *flagFile != "" {
 		names = append(names, *flagFile)
 	} else if *flagDir != "" {
 		names = getFileNames(*flagDir)
 	} else {
 		panic("Flag or FlagDir required")
+	}
+
+	if *flagDistill != "" {
+		distill = true
 	}
 	for _, file := range(names) {
 		fmt.Printf("Scanning file: %s\n", file)
@@ -69,24 +77,34 @@ func ParseTraces(target *prog.Target, distill bool) []*prog.Prog {
 			fmt.Fprintf(os.Stderr, "File: %s is empty\n", file)
 			continue
 		}
-		progs := ParseTree(tree, tree.RootPid, target)
-		ret = append(ret, progs...)
+		ctxs := ParseTree(tree, tree.RootPid, target)
+		ret = append(ret, ctxs...)
 		i := 0
-		for _, prog_ := range progs {
-			prog_.Target = target
+		seeds := make(distiller.Seeds, 0)
+		for _, ctx := range ctxs {
+			ctx.Prog.Target = ctx.Target
 			if !distill {
-				if progIsTooLarge(prog_) {
+				if fail := FillOutMemory(ctx.Prog, ctx.State.Tracker); fail {
+					fmt.Fprintln(os.Stderr, "Failed to fill out memory\n")
+					continue
+				}
+				if progIsTooLarge(ctx.Prog) {
 					fmt.Fprintln(os.Stderr, "Prog is too large\n")
 					continue
 				}
 				i += 1
 				s_name := "serialized/" + filepath.Base(file) + strconv.Itoa(i)
-				if err := ioutil.WriteFile(s_name, prog_.Serialize(), 0640); err != nil {
+				if err := ioutil.WriteFile(s_name, ctx.Prog.Serialize(), 0640); err != nil {
 					Failf("failed to output file: %v", err)
+				}
+			} else {
+				newSeeds := ctx.GenerateSeeds()
+				for _, seed := range newSeeds {
+					seeds.Add(seed)
 				}
 			}
 		}
-
+		fmt.Fprintf(os.Stderr, "Total number of seeds: %d\n", seeds.Len())
 	}
 	return ret
 }
@@ -104,45 +122,50 @@ func getFileNames(dir string) []string {
 	return names
 }
 
-func ParseTree(tree *strace_types.TraceTree, pid int64, target *prog.Target) []*prog.Prog {
+func ParseTree(tree *strace_types.TraceTree, pid int64, target *prog.Target) []*Context {
 	fmt.Fprintf(os.Stderr, "Parsing tree for file: %s\n", tree.Filename)
-	progs := make([]*prog.Prog, 0)
-	parsedProg, ctx, err := ParseProg(tree.TraceMap[pid], target)
+	ctxs := make([]*Context, 0)
+	ctx, err := ParseProg(tree.TraceMap[pid], target)
+	parsedProg := ctx.Prog
 	if err != nil {
 		panic("Failed to parse program")
-	} else {
-		if len(parsedProg.Calls) == 0 {
-			parsedProg = nil
-		}else {
-			if err = ctx.State.Tracker.FillOutMemory(parsedProg); err != nil {
-				fmt.Fprintf(os.Stderr, "Out of bounds memory: %s %d\n", tree.Filename, pid)
-				parsedProg = nil
-			} else {
-				totalMemory := ctx.State.Tracker.GetTotalMemoryAllocations(parsedProg)
-				if totalMemory == 0 {
-					fmt.Printf("length of zero mem prog: %d\n", totalMemory)
-				} else {
-					mmapCall := ctx.Target.MakeMmap(0, uint64(totalMemory))
-					calls := make([]*prog.Call, 0)
-					calls = append(append(calls, mmapCall), parsedProg.Calls...)
-					parsedProg.Calls = calls
-				}
-				if err := parsedProg.Validate(); err != nil {
-					panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
-				}
-			}
-		}
 	}
+
+	if len(parsedProg.Calls) == 0 {
+		parsedProg = nil
+	}
+
 	if parsedProg != nil {
+		ctx.Prog = parsedProg
 		fmt.Fprintf(os.Stderr, "Appending program: %s %d\n", tree.Filename, pid)
-		progs = append(progs, parsedProg)
+		ctxs = append(ctxs, ctx)
 	}
 	for _, pid_ := range(tree.Ptree[pid]) {
 		if tree.TraceMap[pid_] != nil{
-			progs = append(progs, ParseTree(tree, pid_, target)...)
+			ctxs = append(ctxs, ParseTree(tree, pid_, target)...)
 		}
 	}
-	return progs
+	return ctxs
+}
+
+func FillOutMemory(prog_ *prog.Prog, tracker *tracker.MemoryTracker) bool {
+	if err := tracker.FillOutMemory(prog_); err != nil {
+		return false
+	} else {
+		totalMemory := tracker.GetTotalMemoryAllocations(prog_)
+		if totalMemory == 0 {
+			fmt.Printf("length of zero mem prog: %d\n", totalMemory)
+		} else {
+			mmapCall := prog_.Target.MakeMmap(0, uint64(totalMemory))
+			calls := make([]*prog.Call, 0)
+			calls = append(append(calls, mmapCall), prog_.Calls...)
+			prog_.Calls = calls
+		}
+		if err := prog_.Validate(); err != nil {
+			panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
+		}
+	}
+	return true
 }
 
 

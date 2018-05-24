@@ -254,6 +254,14 @@ type ResultArg struct {
 	uses  map[*ResultArg]bool // ArgResult args that use this arg
 }
 
+func (r *ResultArg) Set(uses map[*ResultArg]bool) {
+	r.uses = uses
+}
+
+func (r *ResultArg) Uses() map[*ResultArg]bool{
+	return r.uses
+}
+
 
 func MakeResultArg(t Type, r *ResultArg, v uint64) *ResultArg {
 	arg := &ResultArg{ArgCommon: ArgCommon{typ: t}, Res: r, Val: v}

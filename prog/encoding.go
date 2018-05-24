@@ -23,7 +23,18 @@ func (p *Prog) String() string {
 	return buf.String()
 }
 
-
+func (p *Prog) StripDependencies() {
+	for _, c := range p.Calls {
+		c.Ret.Set(nil)
+		for _, arg := range c.Args {
+			switch a := arg.(type) {
+			case *ResultArg:
+				a.Res = nil
+			default:
+			}
+		}
+	}
+}
 
 func (p *Prog) Serialize() []byte {
 	if debug {

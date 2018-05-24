@@ -5,6 +5,7 @@ import (
 	"github.com/google/syzkaller/tools/moonshine/strace_types"
 	"github.com/google/syzkaller/tools/moonshine/tracker"
 	. "github.com/google/syzkaller/tools/moonshine/logging"
+	"github.com/google/syzkaller/tools/moonshine/distiller"
 	"fmt"
 	"encoding/binary"
 	"math/rand"
@@ -53,6 +54,8 @@ type Context struct {
 	CurrentStraceArg strace_types.Type
 	State *tracker.State
 	Target *prog.Target
+	CallToCover map[*prog.Call][]uint64
+	DependsOn map[*prog.Call]map[*prog.Call]int
 }
 
 func NewContext(target *prog.Target) (ctx *Context) {
@@ -62,11 +65,50 @@ func NewContext(target *prog.Target) (ctx *Context) {
 	ctx.State = tracker.NewState(target)
 	ctx.CurrentStraceArg = nil
 	ctx.Target = target
+	ctx.CallToCover = make(map[*prog.Call][]uint64)
+	ctx.DependsOn = make(map[*prog.Call]map[*prog.Call]int, 0)
 	return
 }
 
+func (ctx *Context) GenerateSeeds() distiller.Seeds {
+	var seeds distiller.Seeds = make([]*distiller.Seed, 0)
+	for i, call := range(ctx.Prog.Calls) {
+		var dependsOn map[*prog.Call]int = nil
+		if _, ok := ctx.DependsOn[call]; ok {
+			dependsOn = ctx.DependsOn[call]
+		}
+		seeds.Add(distiller.NewSeed(call,
+			ctx.State,
+			dependsOn,
+			ctx.Prog,
+			i,
+			ctx.CallToCover[call]))
+	}
+	return seeds
+}
 
-func ParseProg(trace *strace_types.Trace, target *prog.Target) (*prog.Prog, *Context, error) {
+func (ctx *Context) FillOutMemory() bool {
+	if err := ctx.State.Tracker.FillOutMemory(ctx.Prog); err != nil {
+		return false
+	} else {
+		totalMemory := ctx.State.Tracker.GetTotalMemoryAllocations(ctx.Prog)
+		if totalMemory == 0 {
+			fmt.Printf("length of zero mem prog: %d\n", totalMemory)
+		} else {
+			mmapCall := ctx.Target.MakeMmap(0, uint64(totalMemory))
+			calls := make([]*prog.Call, 0)
+			calls = append(append(calls, mmapCall), ctx.Prog.Calls...)
+			ctx.Prog.Calls = calls
+		}
+		if err := ctx.Prog.Validate(); err != nil {
+			panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
+		}
+	}
+	return true
+}
+
+
+func ParseProg(trace *strace_types.Trace, target *prog.Target) (*Context, error) {
 	syzProg := new(prog.Prog)
 	syzProg.Target = target
 	ctx := NewContext(target)
@@ -93,12 +135,13 @@ func ParseProg(trace *strace_types.Trace, target *prog.Target) (*prog.Prog, *Con
 			if call == nil {
 				continue
 			}
+			ctx.CallToCover[call] = s_call.Cover
 			syzProg.Calls = append(syzProg.Calls, call)
 		} else {
 			Failf("Failed to parse call: %s\n", s_call.CallName)
 		}
 	}
-	return syzProg, ctx, nil
+	return ctx, nil
 }
 
 func parseCall(ctx *Context) (*prog.Call, error) {
@@ -367,6 +410,9 @@ func IdentifySockaddrNetlinkUnion(ctx *Context) int {
 
 func Parse_BufferType(syzType *prog.BufferType, straceType strace_types.Type, ctx *Context) (prog.Arg, error) {
 	if syzType.Dir() == prog.DirOut {
+		if !syzType.Varlen() {
+			return prog.MakeOutDataArg(syzType, syzType.Size()), nil
+		}
 		switch a := straceType.(type) {
 		case *strace_types.BufferType:
 			return prog.MakeOutDataArg(syzType, uint64(len(a.Val))), nil
@@ -412,6 +458,7 @@ func Parse_BufferType(syzType *prog.BufferType, straceType strace_types.Type, ct
 	}
 	if !syzType.Varlen() {
 		fmt.Printf("Call: %s, Extending buffer\n", ctx.CurrentSyzCall.Meta.CallName)
+		bufVal = strace_types.GenBuff(bufVal, syzType.Size())
 		buf := make([]byte, syzType.Size())
 		valLen := len(bufVal)
 		for i := range(buf) {

@@ -41,6 +41,10 @@ var (
 		"getppid": true, // unsupported
 		"umask": true, // unsupported
 		"adjtimex": true, // unsupported
+		"nanosleep": true,
+		"wait4": true,
+		"wait": true,
+		"futex": true,
 		//"ioctl$FIONBIO": true, // unsupported
 		"rt_sigprocmask": true,
 		"rt_sigaction": true,
@@ -55,18 +59,6 @@ var (
 		"sched_get_priority_max": true,
 	}
 
-	VMACall = map[string] bool {
-		"mmap": true,
-		"munmap": true,
-		"mremap": true,
-		"msync": true,
-		"mprotect": true,
-		"remap_file_pages": true,
-		"shmat": true,
-		"mlock": true,
-		"munlock": true,
-		"madvise": true,
-	}
 
 	Accept_labels = map[string]string {
 		"fd": "", // TODO: this is an illegal value. how do we interpret the uniontype?
@@ -164,9 +156,7 @@ var (
 		Pair{"SOL_SOCKET","SO_PEERCRED"}: "$sock_cred",
 		Pair{"SOL_SOCKET","SO_RCVTIMEO"}: "$sock_timeval",
 		Pair{"SOL_SOCKET","SO_SNDTIMEO"}: "$sock_timeval",
-		Pair{"SOL_SOCKET","SO_ATTACH_BPF"}: "$sock_attack_bpf",
 		Pair{"SOL_SOCKET","SO_TIMESTAMPING"}: "$SO_TIMESTAMPING",
-		Pair{"SOL_SOCKET","SO_ATTACH_FILTER"}: "$SO_ATTACH_FILTER",
 		Pair{"IPPROTO_IPV6", "IPV6_RECVPKTINFO"}: "$inet6_int",
 		Pair{"IPPROTO_IPV6", "IPV6_RECVHOPLIMIT"}: "$inet6_int",
 		Pair{"IPPROTO_IPV6", "IPV6_RECVRTHDR"}: "$inet6_int",
@@ -505,6 +495,44 @@ var (
 		"FS_IOC_GETFLAGS": "$int_out",
 		"FS_IOC_SETFLAGS": "$int_in",
 		"SIOCGIFINDEX": "$sock_SIOCGIFINDEX",
+		"SIOCGIFNAME":"$sock_ifreq",
+		"SIOCSIFLINK":"$sock_ifreq",
+		"SIOCGIFFLAGS":"$sock_ifreq",
+		"SIOCSIFFLAGS":"$sock_ifreq",
+		"SIOCGIFADDR":"$sock_ifreq",
+		"SIOCSIFADDR":"$sock_ifreq",
+		"SIOCGIFDSTADDR":"$sock_ifreq",
+		"SIOCSIFDSTADDR":"$sock_ifreq",
+		"SIOCGIFBRDADDR":"$sock_ifreq",
+		"SIOCSIFBRDADDR": "$sock_ifreq",
+		"SIOCGIFNETMASK":"$sock_ifreq",
+		"SIOCSIFNETMASK":"$sock_ifreq",
+		"SIOCGIFMETRIC":"$sock_ifreq",
+		"SIOCSIFMETRIC":"$sock_ifreq",
+		"SIOCGIFMEM": "$sock_ifreq",
+		"SIOCSIFMEM":"$sock_ifreq",
+		"SIOCGIFMTU":"$sock_ifreq",
+		"SIOCSIFMTU":"$sock_ifreq",
+		"SIOCSIFNAME":"$sock_ifreq",
+		"SIOCSIFHWADDR":"$sock_ifreq",
+		"SIOCGIFENCAP":"$sock_ifreq",
+		"SIOCSIFENCAP":"$sock_ifreq",
+		"SIOCGIFSLAVE": "$sock_ifreq",
+		"SIOCSIFSLAVE": "$sock_ifreq",
+		"SIOCADDMULTI": "$sock_ifreq",
+		"SIOCDELMULTI": "$sock_ifreq",
+		"SIOCSIFPFLAGS":"$sock_ifreq",
+		"SIOCGIFPFLAGS":"$sock_ifreq",
+		"SIOCDIFADDR":"$sock_ifreq",
+		"SIOCSIFHWBROADCAST":"$sock_ifreq",
+		"SIOCGIFCOUNT": "$sock_ifreq",
+		"SIOCGIFTXQLEN": "$sock_ifreq",
+		"SIOCSIFTXQLEN": "$sock_ifreq",
+		"SIOCETHTOOL": "$sock_ifreq",
+		"SIOCGMIIPHY": "$sock_ifreq",
+		"SIOCGMIIREG": "$sock_ifreq",
+		"SIOCSMIIREG":"$sock_ifreq",
+		"SIOCWANDEV":"$sock_ifreq",
 	}
 
 	Socket_labels_pair = map[Pair]string {
@@ -721,7 +749,9 @@ var (
 		"MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE": uint64(1 << 5),
 		"MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE": uint64(1 << 6),
 		"MEMBARRIER_CMD_SHARED": uint64(1 << 0),
-		"SIGUSR2": 31,
+		"SIGUSR2": uint64(31),
+		"SIOCGIWMODE": uint64(0x8B07),
+		"PACKET_HOST": uint64(0),
 		"R_OK": uint64(4),
 		"W_OK": uint64(2),
 		"X_OK": uint64(1),
@@ -729,6 +759,22 @@ var (
 	}
 
 )
+
+func GenBuff(bufVal []byte, size uint64) []byte {
+	var valLen = 0
+	if bufVal != nil {
+		valLen = len(bufVal)
+	}
+	buf := make([]byte, size)
+	for i := range(buf) {
+		if i < valLen {
+			buf[i] = bufVal[i]
+		} else {
+			buf[i] = 0
+		}
+	}
+	return buf
+}
 
 func commonArg(t prog.Type) prog.ArgCommon {
 	common := prog.ArgCommon{}

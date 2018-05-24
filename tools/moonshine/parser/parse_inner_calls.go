@@ -56,7 +56,7 @@ func parse_HtonsHtonl(syzType prog.Type, straceType *strace_types.Call, ctx *Con
 		default:
 			panic("First arg of Htons/Htonl is not expression")
 		}
-	case *prog.ConstType, *prog.IntType:
+	case *prog.ConstType, *prog.IntType, *prog.FlagsType:
 		switch a := straceType.Args[0].(type) {
 		case *strace_types.Expression:
 			val := a.Eval(ctx.Target)

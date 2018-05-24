@@ -32,7 +32,7 @@ import (
     val_syscall *types.Syscall
 }
 
-%token <data> STRING_LITERAL IPV4 IPV6 IDENTIFIER FLAG DATETIME SIGNAL_PLUS SIGNAL_MINUS
+%token <data> STRING_LITERAL IPV4 IPV6 IDENTIFIER FLAG DATETIME SIGNAL_PLUS SIGNAL_MINUS MAC
 %token <val_int> INT
 %token <val_uint> UINT
 %token <val_double> DOUBLE
@@ -54,12 +54,13 @@ import (
 %type <val_types> types
 %type <val_syscall> syscall
 
-%token STRING_LITERAL IPV4 IPV6 IDENTIFIER FLAG INT UINT QUESTION DOUBLE ARROW
+%token STRING_LITERAL IPV4 IPV6 MAC IDENTIFIER FLAG INT UINT QUESTION DOUBLE ARROW
 %token OR AND LOR TIMES LAND LEQUAL ONESCOMP LSHIFT RSHIFT TIMES NOT
 %token COMMA LBRACKET RBRACKET LBRACKET_SQUARE RBRACKET_SQUARE LPAREN RPAREN EQUALS
 %token UNFINISHED RESUMED
 %token SIGNAL_PLUS SIGNAL_MINUS NULL AT COLON
 
+%nonassoc NOTYPE
 %nonassoc FLAG
 %nonassoc NOFLAG
 
@@ -187,9 +188,11 @@ array_type:
 
 struct_type:
     LBRACKET types RBRACKET {$$ = types.NewStructType($2)}
+    | LBRACKET types COMMA RBRACKET {$$ = types.NewStructType($2)}
 
 field_type:
-    IDENTIFIER EQUALS type {$$ = types.NewField($1, $3);}
+     IDENTIFIER EQUALS %prec NOTYPE {$$ = types.NewField($1, nil);}
+    | IDENTIFIER EQUALS type {$$ = types.NewField($1, $3);}
     | IDENTIFIER COLON type {$$ = types.NewField($1, $3);}
     | IDENTIFIER EQUALS AT type {$$ = types.NewField($1, $4);}
 
@@ -243,6 +246,7 @@ flag_type:
 ip_type:
     IPV4 {$$ = types.NewIpType($1)}
     | IPV6 {$$ = types.NewIpType($1)}
+    | MAC {$$ = types.NewIpType($1)}
 
 identifiers:
     IDENTIFIER {ids := make([]*types.BufferType, 0); ids = append(ids, types.NewBufferType($1)); $$ = ids}
