@@ -49,8 +49,12 @@ var (
 		"rt_sigprocmask": true,
 		"rt_sigaction": true,
 		"rt_sigtimedwait":true,
+		"rt_sigreturn": true,
+		"rt_sigqueueinfo": true,
+		"rt_sigsuspend": true,
+		"tgkill": true,
 		"sysfs": true, // unsupported
-		"chdir": true, // unsupported
+		//"chdir": true, // unsupported
 		"clone": true, // unsupported
 		"newfstatat": true, // unsupported
 		"getsid": true,
@@ -756,6 +760,14 @@ var (
 		"W_OK": uint64(2),
 		"X_OK": uint64(1),
 		"F_OK": uint64(0),
+		"O_ACCMODE": uint64(3),
+		"SIGRTMIN": uint64(32),
+		"SCHED_OTHER": uint64(0),
+		"SIGABRT": uint64(6),
+		"SIGXFSZ": uint64(25),
+		"SIGCHLD": uint64(20),
+		"SIGTSTP": uint64(18),
+		"SIGCONT": uint64(19),
 	}
 
 )

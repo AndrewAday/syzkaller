@@ -2,8 +2,8 @@ package config
 
 import (
 	"io/ioutil"
-	"github.com/Sirupsen/logrus"
 	"encoding/json"
+	. "github.com/google/syzkaller/tools/moonshine/logging"
 )
 
 type SyzStraceConfig struct {
@@ -52,10 +52,22 @@ type GceConfig struct {
 func NewConfig(location string) (config *SyzStraceConfig) {
 	dat, fileErr := ioutil.ReadFile(location)
 	if fileErr != nil {
-		logrus.Fatalf("Unable to read config, exiting")
+		Failf("Unable to read config, exiting")
 	}
 	if err := json.Unmarshal(dat, &config); err != nil {
-		logrus.Fatalf("Unable to read config: %s", err.Error())
+		Failf("Unable to read config: %s", err.Error())
+	}
+	return
+}
+
+func NewDistillConfig(location string) (config *DistillConfig) {
+	dat, fileErr := ioutil.ReadFile(location)
+	if fileErr != nil {
+		Failf("Unable to read distill config, exiting")
+
+	}
+	if err := json.Unmarshal(dat, &config); err != nil {
+		Failf("Unable to marshall distill config: %s", err.Error())
 	}
 	return
 }

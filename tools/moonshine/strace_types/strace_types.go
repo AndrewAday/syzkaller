@@ -153,6 +153,7 @@ func (s *Syscall) String() string {
 type Type interface {
 	Name() string
 	String() string
+	Eval(*prog.Target) uint64
 }
 
 type DynamicType struct {
@@ -172,13 +173,18 @@ func (d *DynamicType) Name() string {
 	return "Dynamic Type"
 }
 
+func (d *DynamicType) Eval(target *prog.Target) uint64 {
+	panic("Eval called on DynamicType")
+}
+
 type Expression struct {
 	BinOp *Binop
 	Unop *Unop
 	FlagType *FlagType
+	FlagsType Flags
 	IntType *IntType
 	MacroType *Macro
-	BinarySetType *BinarySet
+	SetType *Set
 }
 
 func NewExpression(typ Type) (exp *Expression) {
@@ -192,10 +198,12 @@ func NewExpression(typ Type) (exp *Expression) {
 		exp.IntType = a
 	case *FlagType:
 		exp.FlagType = a
+	case Flags:
+		exp.FlagsType = a
 	case *Macro:
 		exp.MacroType = a
-	case *BinarySet:
-		exp.BinarySetType = a
+	case *Set:
+		exp.SetType = a
 	default:
 		panic(fmt.Sprintf("Expression received wrong type: %s", typ.Name()))
 	}
@@ -214,6 +222,8 @@ func (r *Expression) String() string {
 
 	} else if r.FlagType != nil {
 		return r.FlagType.String()
+	} else if r.FlagsType != nil {
+		return r.FlagsType.String()
 	} else if r.IntType != nil {
 		return r.IntType.String()
 	}
@@ -227,6 +237,8 @@ func (e *Expression) Eval(target *prog.Target) uint64 {
 		return e.Unop.Eval(target)
 	} else if e.FlagType != nil {
 		return e.FlagType.Eval(target)
+	} else if e.FlagsType != nil {
+		return e.FlagsType.Eval(target)
 	} else if e.IntType != nil {
 		return e.IntType.Eval(target)
 	}
@@ -267,6 +279,10 @@ func (m *Macro) String() string {
 	return buf.String()
 }
 
+func (m *Macro) Eval(target *prog.Target) uint64 {
+	panic("Eval called on macro type")
+}
+
 type Call struct {
 	CallName string
 	Args []Type
@@ -293,17 +309,22 @@ func (c *Call) String() string {
 	return buf.String()
 }
 
+func (c *Call) Eval(target *prog.Target) uint64 {
+	panic("Eval called on call type")
+	return 0
+}
+
 type Binop struct {
 	Operand1 *Expression
 	Op Operation
 	Operand2 *Expression
 }
 
-func NewBinop(operand1 *Expression, op Operation, operand2 *Expression) (b *Binop){
+func NewBinop(operand1 Type, op Operation, operand2 Type) (b *Binop){
 	b = new(Binop)
-	b.Operand1 = operand1
+	b.Operand1 = operand1.(*Expression)
 	b.Op = op
-	b.Operand2 = operand2
+	b.Operand2 = operand2.(*Expression)
 	return
 }
 
@@ -341,9 +362,9 @@ type Unop struct {
 	Op Operation
 }
 
-func NewUnop(operand *Expression, op Operation) (u *Unop) {
+func NewUnop(operand Type, op Operation) (u *Unop) {
 	u = new(Unop)
-	u.Operand = operand
+	u.Operand = operand.(*Expression)
 	u.Op = op
 	return
 }
@@ -386,6 +407,10 @@ func (f *Field) String() string {
 	return f.Val.String()
 }
 
+func (f *Field) Eval(target *prog.Target) uint64 {
+	panic("Eval called on Field Type")
+}
+
 type IntType struct {
 	Val int64
 }
@@ -406,7 +431,33 @@ func (i *IntType) Name() string {
 
 func (i *IntType) String() string {
 	v := strconv.FormatInt(i.Val, 10)
-	return fmt.Sprintf("%s", v)
+ 	return fmt.Sprintf("%s", v)
+}
+
+type Flags []*FlagType
+
+func (f Flags) Eval(target *prog.Target) uint64 {
+	if len(f) > 1 {
+		panic("Unable to Evaluate Set")
+	} else if len(f) == 1 {
+		return f[0].Eval(target)
+	} else {
+		return 0
+	}
+}
+
+func (f Flags) Name() string {
+	return "Flags Type"
+}
+
+func (f Flags) String() string {
+	if len(f) > 1 {
+		panic("Cannot get string for set")
+	} else if len(f) == 1 {
+		return f[0].String()
+	} else {
+		return ""
+	}
 }
 
 type FlagType struct {
@@ -437,24 +488,26 @@ func (f *FlagType) String() string {
 	return fmt.Sprintf("%s", f.Val)
 }
 
-type BinarySet struct {
-	Expr1 *Expression
-	Expr2 *Expression
+type Set struct {
+	Exprs []*Expression
 }
 
-func NewBinarySet(expr1 *Expression, expr2 *Expression) *BinarySet{
-	return &BinarySet {
-		Expr1 : expr1,
-		Expr2 : expr2,
+func NewSet(exprs []*Expression) *Set{
+	return &Set{
+		Exprs: exprs,
 	}
 }
 
-func (b *BinarySet) Name() string {
-	return "BinarySet Type"
+func (b *Set) Name() string {
+	return "Set Type"
 }
 
-func (b *BinarySet) String() string {
-	return b.Expr1.String() + b.Expr2.String()
+func (b *Set) String() string {
+	return ""
+}
+
+func (b *Set) Eval(target *prog.Target) uint64 {
+	panic("Eval called for set type\n")
 }
 
 type BufferType struct {
@@ -473,6 +526,10 @@ func (b *BufferType) Name() string {
 
 func (b *BufferType) String() string {
 	return fmt.Sprintf("String Type: %d\n", len(b.Val))
+}
+
+func (b *BufferType) Eval(target *prog.Target) uint64 {
+	panic("Eval called for buffer type")
 }
 
 type PointerType struct {
@@ -513,6 +570,10 @@ func (p *PointerType) String() string {
 	return buf.String()
 }
 
+func (p *PointerType) Eval(target *prog.Target) uint64 {
+	panic("Eval called for PointerType")
+}
+
 
 type StructType struct {
 	Fields []Type
@@ -538,6 +599,10 @@ func (s *StructType) String() string {
 	}
 	buf.WriteString("}")
 	return buf.String()
+}
+
+func (s *StructType) Eval(target *prog.Target) uint64 {
+	panic("Eval Called For Struct Type")
 }
 
 type ArrayType struct {
@@ -568,6 +633,9 @@ func (a *ArrayType) String() string {
 	return buf.String()
 }
 
+func (a *ArrayType) Eval(target *prog.Target) uint64 {
+	panic("Eval called for Array Type")
+}
 
 type IpType struct {
 	Str string
@@ -585,4 +653,8 @@ func (i *IpType) Name() string {
 
 func (i *IpType) String() string {
 	return fmt.Sprintf("Ip type :%s", i.Str)
+}
+
+func (i *IpType) Eval(target *prog.Target) uint64 {
+	panic("Eval called for ip type")
 }
