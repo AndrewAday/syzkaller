@@ -2,7 +2,7 @@ package distiller
 
 import (
 	"github.com/google/syzkaller/prog"
-	"github.com/google/syzkaller/tools/syz-strace/config"
+	"github.com/google/syzkaller/tools/moonshine/configs"
 	"github.com/google/syzkaller/tools/moonshine/implicit-dependencies"
 )
 
@@ -16,7 +16,7 @@ type StrongDistiller struct {
 	*DistillerMetadata
 }
 
-func NewDistiller(conf config.DistillConfig) (d Distiller){
+func NewDistiller(conf *config.DistillConfig) (d Distiller){
 	switch (conf.Type) {
 	case "weak":
 		d = NewWeakDistiller(conf)
@@ -34,7 +34,7 @@ func NewDistiller(conf config.DistillConfig) (d Distiller){
 	return
 }
 
-func NewRandomDistiller(conf config.DistillConfig) (d *RandomDistiller) {
+func NewRandomDistiller(conf *config.DistillConfig) (d *RandomDistiller) {
 	d = new(RandomDistiller)
 	dm := &DistillerMetadata{
 		StatFile: conf.Stats,
@@ -50,7 +50,7 @@ func NewRandomDistiller(conf config.DistillConfig) (d *RandomDistiller) {
 }
 
 
-func NewTraceDistiller(conf config.DistillConfig) (d *TraceDistiller) {
+func NewTraceDistiller(conf *config.DistillConfig) (d *TraceDistiller) {
 	d = new(TraceDistiller)
 	dm := &DistillerMetadata{
 		StatFile: conf.Stats,
@@ -66,7 +66,7 @@ func NewTraceDistiller(conf config.DistillConfig) (d *TraceDistiller) {
 }
 
 
-func NewStrongDistiller(conf config.DistillConfig) (d *StrongDistiller) {
+func NewStrongDistiller(conf *config.DistillConfig) (d *StrongDistiller) {
 	d = new(StrongDistiller)
 	dm := &DistillerMetadata{
 		StatFile: conf.Stats,
@@ -81,7 +81,7 @@ func NewStrongDistiller(conf config.DistillConfig) (d *StrongDistiller) {
 	return
 }
 
-func NewWeakDistiller(conf config.DistillConfig) (d *WeakDistiller) {
+func NewWeakDistiller(conf *config.DistillConfig) (d *WeakDistiller) {
 	d = new(WeakDistiller)
 	dm := &DistillerMetadata{
 		StatFile: conf.Stats,
@@ -96,7 +96,7 @@ func NewWeakDistiller(conf config.DistillConfig) (d *WeakDistiller) {
 	return
 }
 
-func NewImplicitDistiller(conf config.DistillConfig) (d *ImplicitDistiller) {
+func NewImplicitDistiller(conf *config.DistillConfig) (d *ImplicitDistiller) {
 	d = new(ImplicitDistiller)
 	dm := &DistillerMetadata{
 		StatFile: conf.Stats,

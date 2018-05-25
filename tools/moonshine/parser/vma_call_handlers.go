@@ -5,6 +5,7 @@ import (
 	"github.com/google/syzkaller/prog"
 	"github.com/google/syzkaller/tools/moonshine/strace_types"
 	"github.com/google/syzkaller/tools/moonshine/tracker"
+	"fmt"
 )
 
 const (
@@ -44,6 +45,8 @@ func ParseMmap(mmap *prog.Syscall, syscall *strace_types.Syscall, ctx *Context) 
 		Meta: mmap,
 		Ret: strace_types.ReturnArg(mmap.Ret),
 	}
+	ctx.CurrentSyzCall = call
+
 	length := uint64(0)
 
 	length = ParseLength(syscall.Args[1], ctx)
@@ -72,6 +75,7 @@ func ParseMremap(mremap *prog.Syscall, syscall *strace_types.Syscall, ctx *Conte
 		Meta: mremap,
 		Ret: strace_types.ReturnArg(mremap.Ret),
 	}
+	ctx.CurrentSyzCall = call
 
 
 	oldAddrArg, start := ParseAddr(pageSize, mremap.Args[0], syscall.Args[0], ctx)
@@ -107,6 +111,7 @@ func ParseMsync(msync *prog.Syscall, syscall *strace_types.Syscall, ctx *Context
 		Meta: msync,
 		Ret: strace_types.ReturnArg(msync.Ret),
 	}
+	ctx.CurrentSyzCall = call
 
 	addrArg, address := ParseAddr(pageSize, msync.Args[0], syscall.Args[0], ctx)
 	length := uint64(0)
@@ -127,6 +132,7 @@ func ParseMprotect(mprotect *prog.Syscall, syscall *strace_types.Syscall, ctx *C
 		Meta: mprotect,
 		Ret: strace_types.ReturnArg(mprotect.Ret),
 	}
+	ctx.CurrentSyzCall = call
 
 	addrArg, address := ParseAddr(pageSize, mprotect.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
@@ -146,6 +152,8 @@ func ParseMunmap(munmap *prog.Syscall, syscall *strace_types.Syscall, ctx *Conte
 		Meta: munmap,
 		Ret: strace_types.ReturnArg(munmap.Ret),
 	}
+	ctx.CurrentSyzCall = call
+
 	addrArg, address := ParseAddr(pageSize, munmap.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
 	lengthArg := prog.MakeConstArg(munmap.Args[1], length)
@@ -162,6 +170,8 @@ func ParseMadvise(madvise *prog.Syscall, syscall *strace_types.Syscall, ctx *Con
 		Meta: madvise,
 		Ret: strace_types.ReturnArg(madvise.Ret),
 	}
+	ctx.CurrentSyzCall = call
+
 	addrArg, address := ParseAddr(pageSize, madvise.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
 	lengthArg := prog.MakeConstArg(madvise.Args[1], length)
@@ -186,6 +196,8 @@ func ParseMlock(mlock *prog.Syscall, syscall *strace_types.Syscall, ctx *Context
 		Meta: mlock,
 		Ret : strace_types.ReturnArg(mlock.Ret),
 	}
+	ctx.CurrentSyzCall = call
+
 	addrArg, address := ParseAddr(pageSize, mlock.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
 	flagArg := strace_types.ConstArg(mlock.Args[1], length)
@@ -202,6 +214,7 @@ func ParseMunlock(munlock *prog.Syscall, syscall *strace_types.Syscall, ctx *Con
 		Meta: munlock,
 		Ret : strace_types.ReturnArg(munlock.Ret),
 	}
+	ctx.CurrentSyzCall = call
 	addrArg, address := ParseAddr(pageSize, munlock.Args[0], syscall.Args[0], ctx)
 	length := ParseLength(syscall.Args[1], ctx)
 	flagArg := strace_types.ConstArg(munlock.Args[1], length)
@@ -227,6 +240,7 @@ func ParseShmat(shmat *prog.Syscall, syscall *strace_types.Syscall, ctx *Context
 		Meta: shmat,
 		Ret: strace_types.ReturnArg(shmat.Ret),
 	}
+	ctx.CurrentSyzCall = call
 
 	if arg := ctx.Cache.Get(shmat.Args[0], syscall.Args[0]); arg != nil {
 		fd = strace_types.ResultArg(shmat.Args[0], arg.(*prog.ResultArg), arg.Type().Default())
@@ -289,6 +303,7 @@ func AddDependency(start, length uint64, addr prog.Arg, ctx *Context) {
 		for _, dep := range mapping.GetUsedBy() {
 			dependsOn[ctx.Prog.Calls[dep.Callidx]] = dep.Callidx
 		}
+		fmt.Printf("CHECKING DEPENDS ON: %s %#v\n", ctx.CurrentSyzCall.Meta.Name, dependsOn)
 		ctx.DependsOn[ctx.CurrentSyzCall] = dependsOn
 		dep := tracker.NewMemDependency(len(ctx.Prog.Calls), addr, start, start+length)
 		mapping.AddDependency(dep)

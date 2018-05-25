@@ -66,12 +66,16 @@ func (d *StrongDistiller) Distill(progs []*prog.Prog) (distilled []*prog.Prog) {
 		state := seed.State
 		if err := d.CallToSeed[prog_.Calls[0]].State.Tracker.FillOutMemory(prog_); err != nil {
 			fmt.Printf("Error: %s\n", err.Error())
-            continue
+            		continue
 		}
-		totalMemory := state.Tracker.GetTotalMemoryAllocations(prog_)
-		mmapCall := state.Target.MakeMmap(0, uint64(totalMemory/pageSize)+1)
+
+		totalMemoryAllocations := d.CallToSeed[prog_.Calls[0]].State.Tracker.GetTotalMemoryAllocations(prog_)
+		mmapCall := state.Target.MakeMmap(0, uint64(totalMemoryAllocations))
 		calls := make([]*prog.Call, 0)
 		calls = append(append(calls, mmapCall), prog_.Calls...)
+
+		prog_.Calls = calls
+		prog_.Target = state.Target
 
 		prog_.Calls = calls
 		distilled = append(distilled, prog_)

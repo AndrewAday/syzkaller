@@ -278,6 +278,7 @@ func (d *DistillerMetadata) isDependent(arg prog.Arg, seed *Seed, state *tracker
 			if typ.ArgDir != prog.DirOut && len(a.Data()) != 0 {
 				switch typ.Kind {
 				case prog.BufferFilename:
+					fmt.Printf("DISTILLER FILE NAME: %#v\n", state.Files)
 					callMap := make(map[*prog.Call]bool, 0)
 					for s, calls := range state.Files {
 						if s == string(a.Data()) {

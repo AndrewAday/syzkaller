@@ -60,9 +60,10 @@ func (s *State) Analyze(c *Call) {
 						// This is not our file, probalby one of specialFiles.
 						return
 					}
+					/*
 					if val[len(val)-1] == 0 {
 						val = val[:len(val)-1]
-					}
+					}*/
 					if s.Files[val] == nil {
 						s.Files[val] = make([]*Call, 0)
 					}

@@ -72,9 +72,12 @@ func NewContext(target *prog.Target) (ctx *Context) {
 
 func (ctx *Context) GenerateSeeds() distiller.Seeds {
 	var seeds distiller.Seeds = make([]*distiller.Seed, 0)
+	fmt.Printf("ctx depends on: %v\n", ctx.DependsOn)
 	for i, call := range(ctx.Prog.Calls) {
 		var dependsOn map[*prog.Call]int = nil
+		fmt.Printf("Call: %p\n", call)
 		if _, ok := ctx.DependsOn[call]; ok {
+			fmt.Printf("GENERATING DEPENDS ON\n")
 			dependsOn = ctx.DependsOn[call]
 		}
 		seeds.Add(distiller.NewSeed(call,
@@ -85,6 +88,14 @@ func (ctx *Context) GenerateSeeds() distiller.Seeds {
 			ctx.CallToCover[call]))
 	}
 	return seeds
+}
+
+func GetProgs(ctxs []*Context) []*prog.Prog {
+	progs := make([]*prog.Prog, 0)
+	for _, ctx := range(ctxs) {
+		progs = append(progs, ctx.Prog)
+	}
+	return progs
 }
 
 func (ctx *Context) FillOutMemory() bool {
@@ -132,10 +143,12 @@ func ParseProg(trace *strace_types.Trace, target *prog.Target) (*Context, error)
 			continue
 		}
 		if call, err := parseCall(ctx); err == nil {
+			fmt.Printf("Parsed Call: %p\n", call)
 			if call == nil {
 				continue
 			}
 			ctx.CallToCover[call] = s_call.Cover
+			ctx.State.Analyze(call)
 			syzProg.Calls = append(syzProg.Calls, call)
 		} else {
 			Failf("Failed to parse call: %s\n", s_call.CallName)
@@ -158,11 +171,11 @@ func parseCall(ctx *Context) (*prog.Call, error) {
 		return nil, nil
 	}
 	retCall.Ret = strace_types.ReturnArg(ctx.CurrentSyzCall.Meta.Ret)
+	fmt.Printf("Parsing Call: %s\n", ctx.CurrentSyzCall.Meta.Name)
 
 	if call := ParseMemoryCall(ctx); call != nil {
 		return call, nil
 	}
-	fmt.Printf("Parsing Call: %s\n", ctx.CurrentSyzCall.Meta.Name)
 	if len(retCall.Meta.Args) != len(straceCall.Args) {
 		fmt.Printf("syzkaller system call: " +
 			"%s has %d arguments strace call: " +

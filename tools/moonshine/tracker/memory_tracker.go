@@ -208,10 +208,11 @@ func (m *MemoryTracker) FillOutMemory(prog *Prog) error {
 			}
 		}
 	}
-
 	if offset % PageSize > 0 {
 		offset = (offset/PageSize+1)*PageSize
 	}
+	fmt.Printf("Call Len: %d Offset: %d\n", len(prog.Calls), offset)
+
 	for _, mapping := range m.mappings {
 		for _, dep := range mapping.usedBy {
 			switch arg_ := dep.arg.(type) {

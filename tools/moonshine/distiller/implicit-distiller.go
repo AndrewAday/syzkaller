@@ -65,10 +65,15 @@ func (d *ImplicitDistiller) Distill(progs []*prog.Prog) (distilled []*prog.Prog)
 	fmt.Printf("Performing implicit distillation with %d seeds\n", len(seeds))
 	sort.Sort(sort.Reverse(seeds))  // sort seeds by inidividual coverage.
 	heavyHitters := make(Seeds, 0)
+	var target *prog.Target = nil
 	for _, prog := range progs {
+		if target == nil {
+			target = prog.Target
+		}
 		d.TrackDependencies(prog)
 	}
 	heavyHitters = d.getHeavyHitters(seeds)
+	//heavyHitters = seeds
 	for _, seed := range heavyHitters {
 		d.AddToDistilledProg(seed)
 	}
@@ -84,13 +89,18 @@ func (d *ImplicitDistiller) Distill(progs []*prog.Prog) (distilled []*prog.Prog)
 			continue
 		}
 		totalMemoryAllocations := d.CallToSeed[prog_.Calls[0]].State.Tracker.GetTotalMemoryAllocations(prog_)
-		state := d.CallToSeed[prog_.Calls[0]].State
-		mmapCall := state.Target.MakeMmap(0, uint64(totalMemoryAllocations/pageSize)+1)
+		fmt.Printf("Total Memory Allocations: %d\n", totalMemoryAllocations)
 		calls := make([]*prog.Call, 0)
-		calls = append(append(calls, mmapCall), prog_.Calls...)
+		state := d.CallToSeed[prog_.Calls[0]].State
+		if totalMemoryAllocations > 0 {
+			mmapCall := state.Target.MakeMmap(0, uint64(totalMemoryAllocations))
+			calls = append(calls, mmapCall)
+		}
+
+		calls = append(calls, prog_.Calls...)
 
 		prog_.Calls = calls
-
+		prog_.Target = target
 		distilled = append(distilled, prog_)
 	}
 	avgLen := 0
