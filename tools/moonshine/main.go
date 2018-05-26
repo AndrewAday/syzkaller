@@ -19,12 +19,13 @@ import (
 	"path"
 	"github.com/google/syzkaller/tools/moonshine/tracker"
 	"github.com/google/syzkaller/tools/moonshine/distiller"
+	"github.com/google/syzkaller/tools/moonshine/configs"
 )
 
 var (
 	flagFile = flag.String("file", "", "file to parse")
 	flagDir = flag.String("dir", "", "director to parse")
-	flagDistill = flag.String("distill", "", "distillation strategy")
+	flagDistill = flag.String("distill", "", "Path to distillation config")
 )
 
 const (
@@ -70,6 +71,7 @@ func ParseTraces(target *prog.Target) []*Context {
 	if *flagDistill != "" {
 		distill = true
 	}
+	seeds := make(distiller.Seeds, 0)
 	for _, file := range(names) {
 		fmt.Printf("Scanning file: %s\n", file)
 		tree := Parse(file)
@@ -80,11 +82,10 @@ func ParseTraces(target *prog.Target) []*Context {
 		ctxs := ParseTree(tree, tree.RootPid, target)
 		ret = append(ret, ctxs...)
 		i := 0
-		seeds := make(distiller.Seeds, 0)
 		for _, ctx := range ctxs {
 			ctx.Prog.Target = ctx.Target
 			if !distill {
-				if fail := FillOutMemory(ctx.Prog, ctx.State.Tracker); fail {
+				if err := FillOutMemory(ctx.Prog, ctx.State.Tracker); err != nil {
 					fmt.Fprintln(os.Stderr, "Failed to fill out memory\n")
 					continue
 				}
@@ -104,10 +105,31 @@ func ParseTraces(target *prog.Target) []*Context {
 				}
 			}
 		}
+
 		fmt.Fprintf(os.Stderr, "Total number of seeds: %d\n", seeds.Len())
+	}
+	if distill {
+		distler := distiller.NewDistiller(config.NewDistillConfig(*flagDistill))
+		distler.Add(seeds)
+		distilledProgs := distler.Distill(GetProgs(ret))
+		for i, prog_ := range distilledProgs {
+			if progIsTooLarge(prog_) {
+				fmt.Fprintln(os.Stderr, "Prog is too large")
+				continue
+			}
+			if err := prog_.Validate(); err != nil {
+				panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
+			}
+			s_name := "serialized/" + "distill" + strconv.Itoa(i)
+			if err := ioutil.WriteFile(s_name, prog_.Serialize(), 0640); err != nil {
+				Failf("failed to output file: %v", err)
+			}
+		}
 	}
 	return ret
 }
+
+
 
 func getFileNames(dir string) []string {
 	names := make([]string, 0)
@@ -148,9 +170,9 @@ func ParseTree(tree *strace_types.TraceTree, pid int64, target *prog.Target) []*
 	return ctxs
 }
 
-func FillOutMemory(prog_ *prog.Prog, tracker *tracker.MemoryTracker) bool {
+func FillOutMemory(prog_ *prog.Prog, tracker *tracker.MemoryTracker) error {
 	if err := tracker.FillOutMemory(prog_); err != nil {
-		return false
+		return err
 	} else {
 		totalMemory := tracker.GetTotalMemoryAllocations(prog_)
 		if totalMemory == 0 {
@@ -165,7 +187,7 @@ func FillOutMemory(prog_ *prog.Prog, tracker *tracker.MemoryTracker) bool {
 			panic(fmt.Sprintf("Error validating program: %s\n", err.Error()))
 		}
 	}
-	return true
+	return nil
 }
 
 
