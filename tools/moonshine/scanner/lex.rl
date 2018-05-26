@@ -43,7 +43,7 @@ func (lex *lexer) Lex(out *StraceSymType) int {
             digit{2}.':'.digit{2}.':'.digit{2}.'+'.digit{4};
         datetime = date.'T'.time;
         unfinished = '<unfinished ...>' | ',  <unfinished ...>';
-        keywords = 'sizeof' | 'struct' | 'int'
+        keywords = 'sizeof' | 'struct' | 'int';
         identifier = [A-Za-z].[0-9a-z'_'\*\.\-]* - keywords;
         resumed = '<... '.identifier+.' resumed>'
                     | '<... '.identifier+.' resumed> ,'
