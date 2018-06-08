@@ -2,6 +2,7 @@
 package scanner
 
 import (
+    "fmt"
     types "github.com/google/syzkaller/tools/moonshine/strace_types"
 )
 %}
@@ -54,11 +55,14 @@ import (
 %token OR AND LOR TIMES LAND LEQUAL ONESCOMP LSHIFT RSHIFT TIMES NOT
 %token COMMA LBRACKET RBRACKET LBRACKET_SQUARE RBRACKET_SQUARE LPAREN RPAREN EQUALS
 %token UNFINISHED RESUMED
-%token SIGNAL_PLUS SIGNAL_MINUS NULL AT COLON
+%token SIGNAL_PLUS SIGNAL_MINUS NULL AT COLON KEYWORD
 
 %nonassoc NOTYPE
 %nonassoc FLAG
 %nonassoc NOFLAG
+
+%nonassoc EQUAL
+%nonassoc ARROW
 
 %left LOR
 %left LAND
@@ -189,6 +193,7 @@ call_type:
 macro_type:
     FLAG LPAREN types RPAREN {$$ = types.NewMacroType($1, $3)}
     | FLAG LPAREN identifiers RPAREN {$$ = types.NewMacroType($1, nil)}
+    | KEYWORD LPAREN KEYWORD IDENTIFIER RPAREN {fmt.Printf("SIZEOF\n");$$ = types.NewMacroType($4, nil)}
 
 pointer_type:
     AND IDENTIFIER {$$ = types.NullPointer()}

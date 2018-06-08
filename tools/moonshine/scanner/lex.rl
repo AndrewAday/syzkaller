@@ -43,8 +43,9 @@ func (lex *lexer) Lex(out *StraceSymType) int {
             digit{2}.':'.digit{2}.':'.digit{2}.'+'.digit{4};
         datetime = date.'T'.time;
         unfinished = '<unfinished ...>' | ',  <unfinished ...>';
-        keywords = 'sizeof' | 'struct' | 'int';
-        identifier = [A-Za-z].[0-9a-z'_'\*\.\-]* - keywords;
+        or = 'or';
+        keyword = 'sizeof' | 'struct' | 'int';
+        identifier = ([A-Za-z].[0-9a-z'_'\*\.\-]*) - keyword - or;
         resumed = '<... '.identifier+.' resumed>'
                     | '<... '.identifier+.' resumed> ,'
                     | '<... resuming'.' '.identifier.' '.identifier.' '.'...>';
@@ -69,7 +70,9 @@ func (lex *lexer) Lex(out *StraceSymType) int {
             identifier => {out.data = string(lex.data[lex.ts:lex.te]); tok = IDENTIFIER;fbreak;};
             unfinished => {tok = UNFINISHED; fbreak;};
             resumed => {tok = RESUMED; fbreak;};
+            keyword => {fmt.Printf("KEYWORD LEX\n"); tok = KEYWORD; fbreak;};
             mac => {out.data = string(lex.data[lex.ts : lex.te]); tok = MAC; fbreak;};
+            or => {tok = OR; fbreak;};
             '=' => {tok = EQUALS;fbreak;};
             '==' => {tok = LEQUAL; fbreak;};
             '(' => {tok = LPAREN;fbreak;};
@@ -88,6 +91,7 @@ func (lex *lexer) Lex(out *StraceSymType) int {
             '<<' => {tok = LSHIFT; fbreak;};
             '>>' => {tok = RSHIFT; fbreak;};
             '->' => {tok = ARROW; fbreak;};
+            '=>' => {tok = ARROW; fbreak;};
             "||" => {tok = LOR;fbreak;};
             "&&" => {tok = LAND;fbreak;};
             ',' => {tok = COMMA;fbreak;};

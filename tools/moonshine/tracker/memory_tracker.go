@@ -226,8 +226,8 @@ func (m *MemoryTracker) FillOutMemory(prog *Prog) error {
 
 				arg_.Res = nil
 				if arg_.Address >= memAllocMaxMem || arg_.Address+arg_.VmaSize > memAllocMaxMem{
-					return fmt.Errorf("Address out of range: %d\n",
-						arg_.Address)
+					return fmt.Errorf("Address out of range: %d. Vma size: %d\n",
+						arg_.Address, arg_.VmaSize)
 				}
 			default:
 				panic("Mapping needs to be Pointer Arg")

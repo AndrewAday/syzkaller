@@ -500,6 +500,7 @@ var (
 		"FS_IOC_SETFLAGS": "$int_in",
 		"SIOCGIFINDEX": "$sock_SIOCGIFINDEX",
 		"SIOCGIFNAME":"$sock_ifreq",
+		"SIOCGIFCONF": "$sock_SIOCGIFCONF",
 		"SIOCSIFLINK":"$sock_ifreq",
 		"SIOCGIFFLAGS":"$sock_ifreq",
 		"SIOCSIFFLAGS":"$sock_ifreq",
@@ -755,6 +756,7 @@ var (
 		"MEMBARRIER_CMD_SHARED": uint64(1 << 0),
 		"SIGUSR2": uint64(31),
 		"SIOCGIWMODE": uint64(0x8B07),
+		"SIOCGIFCONF": uint64(0x8912),
 		"PACKET_HOST": uint64(0),
 		"R_OK": uint64(4),
 		"W_OK": uint64(2),
@@ -768,6 +770,12 @@ var (
 		"SIGCHLD": uint64(20),
 		"SIGTSTP": uint64(18),
 		"SIGCONT": uint64(19),
+		"FS_IOC_GETFLAGS": uint64(26113),
+		"FS_IOC_SETFLAGS": uint64(26112),
+		"RTC_UIE_ON": uint64(28675),
+		"RTC_UIE_OFF": uint64(28674),
+		"PHN_NOT_OH": uint64(28676),
+		"RTC_RD_TIME": uint64(2149871625),
 	}
 
 )

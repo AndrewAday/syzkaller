@@ -476,7 +476,7 @@ func (f *FlagType) Eval(target *prog.Target) uint64 {
 	} else if val, ok := Special_Consts[f.String()]; ok {
 		return val
 	}
-	panic(fmt.Sprintf("Failed to eval flag: %s\n", f.Val))
+	panic(fmt.Sprintf("Failed to eval flag: %s\n", f.String()))
 }
 
 

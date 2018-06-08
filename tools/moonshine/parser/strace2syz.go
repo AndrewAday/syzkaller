@@ -280,6 +280,9 @@ func Parse_ArrayType(syzType *prog.ArrayType, straceType strace_types.Type, ctx 
 }
 
 func Parse_StructType(syzType *prog.StructType, straceType strace_types.Type, ctx *Context) (prog.Arg, error) {
+	if syzType.Dir() == prog.DirOut {
+		return GenDefaultArg(syzType, ctx), nil
+	}
 	args := make([]prog.Arg, 0)
 	switch a := straceType.(type) {
 	case *strace_types.StructType:
@@ -299,6 +302,8 @@ func Parse_StructType(syzType *prog.StructType, straceType strace_types.Type, ct
 		args = append(args, ParseInnerCall(syzType, a, ctx))
 	case *strace_types.Expression:
 		return GenDefaultArg(syzType, ctx), nil
+	case *strace_types.BufferType:
+		return serialize(syzType, []byte(a.Val), ctx)
 	default:
 		Failf("Unsupported Strace Type: %#v to Struct Type", a)
 	}
@@ -350,11 +355,16 @@ func Parse_UnionType(syzType *prog.UnionType, straceType strace_types.Type, ctx 
 }
 
 func IdentifyUnionType(ctx *Context, typeName string) int {
+	fmt.Printf("TYPE NAME: %s\n", typeName)
 	switch typeName {
 	case "sockaddr_storage":
 		return IdentifySockaddrStorageUnion(ctx)
 	case "sockaddr_nl":
 		return IdentifySockaddrNetlinkUnion(ctx)
+	case "ifr_ifru":
+		return IdentifyIfrIfruUnion(ctx)
+	case "ifconf":
+		return IdentifyIfconfUnion(ctx)
 	}
 	return 0
 }
@@ -419,6 +429,26 @@ func IdentifySockaddrNetlinkUnion(ctx *Context) int {
 		}
 	}
 	return 2
+}
+
+func IdentifyIfrIfruUnion(ctx *Context) int {
+	switch ctx.CurrentStraceArg.(type) {
+	case *strace_types.Expression:
+		return 2
+	case *strace_types.Field:
+		return 2
+	default:
+		return 0
+	}
+}
+
+func IdentifyIfconfUnion(ctx *Context) int {
+	switch ctx.CurrentStraceArg.(type) {
+	case *strace_types.StructType:
+		return 1;
+	default:
+		return 0;
+	}
 }
 
 func Parse_BufferType(syzType *prog.BufferType, straceType strace_types.Type, ctx *Context) (prog.Arg, error) {
@@ -644,8 +674,58 @@ func GenDefaultArg(syzType prog.Type, ctx *Context) prog.Arg {
 	}
 }
 
-func addr(ctx *Context, syzTyp prog.Type, size uint64, data prog.Arg) (prog.Arg, error) {
-	arg := strace_types.PointerArg(syzTyp, uint64(0), 0, data)
+func serialize(syzType prog.Type, buf []byte, ctx *Context) (prog.Arg, error) {
+	fmt.Printf("Serializing object of size: %d: %s: %d\n", syzType.Size(), syzType.Name(), len(buf))
+	switch a := syzType.(type) {
+	case *prog.IntType, *prog.ConstType, *prog.FlagsType, *prog.LenType, *prog.CsumType:
+		return strace_types.ConstArg(a, bufToUint(buf[:syzType.Size()])), nil
+	case *prog.ProcType:
+		return GenDefaultArg(syzType, ctx), nil
+	case *prog.PtrType:
+		if res, err := serialize(a.Type, buf, ctx); err == nil {
+			return addr(ctx, a, res.Size(), res)
+		}
+		panic("Failed to serialize pointer type")
+	case *prog.StructType:
+		pos := uint64(0)
+		bufLen := uint64(len(buf))
+		args := make([]prog.Arg, 0)
+		for _, field := range a.Fields {
+			if pos + field.Size() >= bufLen {
+				args = append(args, GenDefaultArg(field, ctx))
+				continue
+			} else {
+				if res, err := serialize(field, buf[pos:pos+field.Size()], ctx); err == nil {
+					args = append(args, res)
+				} else {
+					panic("Failed to serialize struct field")
+				}
+			}
+			pos += field.Size()
+		}
+		return strace_types.GroupArg(syzType, args), nil
+	default:
+		panic("Unsupported Type\n")
+	}
+}
+
+func bufToUint(buf []byte) uint64 {
+	switch len(buf) {
+	case 1:
+		return uint64(buf[0])
+	case 2:
+		return uint64(binary.LittleEndian.Uint16(buf))
+	case 4:
+		return uint64(binary.LittleEndian.Uint32(buf))
+	case 8:
+		return binary.LittleEndian.Uint64(buf)
+	default:
+		panic("Failed to convert byte to int")
+	}
+}
+
+func addr(ctx *Context, syzType prog.Type, size uint64, data prog.Arg) (prog.Arg, error) {
+	arg := strace_types.PointerArg(syzType, uint64(0), 0, data)
 	ctx.State.Tracker.AddAllocation(ctx.CurrentSyzCall, size, arg)
 	return arg, nil
 }
